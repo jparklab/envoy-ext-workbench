@@ -1,6 +1,11 @@
-# TCP listener on :11433 running the mssql_proxy dynamic module in front of
-# tcp_proxy. The backend is 127.0.0.1:1433 (a local SQL Server, e.g. the
-# mcr.microsoft.com/mssql/server container).
+# TCP listener on :11433 for MS SQL Server clients, backend 127.0.0.1:1433
+# (a local SQL Server, e.g. the mcr.microsoft.com/mssql/server container).
+#
+# tls_inspector splits clients by their first bytes:
+# - TDS 8.0 strict starts with a TLS ClientHello: passed through by tcp_proxy
+#   alone (stat prefix mssql_strict).
+# - TDS 7.x starts with a plain PRELOGIN packet: runs through the mssql_proxy
+#   dynamic module, then tcp_proxy (stat prefix mssql).
 # Envoy loads ${ENVOY_DYNAMIC_MODULES_SEARCH_PATH}/libmssql_proxy.so.
 admin:
   address:
@@ -11,8 +16,22 @@ static_resources:
   - name: mssql
     address:
       socket_address: { address: 0.0.0.0, port_value: 11433 }
+    listener_filters:
+    - name: envoy.filters.listener.tls_inspector
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
     filter_chains:
-    - filters:
+    - filter_chain_match:
+        transport_protocol: tls
+      filters:
+      - name: envoy.filters.network.tcp_proxy
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+          stat_prefix: mssql_strict
+          cluster: mssql_backend
+    - filter_chain_match:
+        transport_protocol: raw_buffer
+      filters:
       - name: mssql_proxy
         typed_config:
           "@type": type.googleapis.com/envoy.extensions.filters.network.dynamic_modules.v3.DynamicModuleNetworkFilter

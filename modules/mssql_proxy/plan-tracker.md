@@ -11,4 +11,5 @@ Progress log against plan.md.
 
 ## Phase 2: TDS framer (test-first)
 
-- [ ] Next up
+- [x] 2026-11-16: listener split with `tls_inspector`; `tests/mssql_server_test.sh` passes for ODBC 17 login-only TLS, ODBC 18 mandatory TLS (module chain) and ODBC 18 strict (passthrough chain) against SQL Server 2025; `scripts/test.sh` 3/3
+- [ ] Next: fixtures via Envoy's tap transport socket, then the framer

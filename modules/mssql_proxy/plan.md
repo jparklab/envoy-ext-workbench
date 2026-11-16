@@ -79,24 +79,34 @@ clients produce login-only encryption (ENCRYPT_OFF, plaintext SQLBatch after
 LOGIN7), raw TLS records that are not TDS-framed, and several TDS packets in one
 TCP segment. An echo backend or hand-written packets would miss all three.
 
-- [ ] `tests/mssql_server_test.sh`: start `mcr.microsoft.com/mssql/server:2022-latest`
-      with a random throwaway SA password and run queries through Envoy for each
-      encryption mode; skip with a message when Docker is unavailable:
-  - [ ] `/opt/mssql-tools` sqlcmd (ODBC 17), default: login-only TLS
-  - [ ] `/opt/mssql-tools18` sqlcmd (ODBC 18), `-N` mandatory with `-C`: full TLS
-  - [ ] `/opt/mssql-tools18` sqlcmd `-N s`: TDS 8.0 strict, which must land on
-        the passthrough chain (module counters unchanged) and complete end to end
-        (unverified against a self-signed container certificate)
+- [x] `tests/mssql_server_test.sh`: start `mcr.microsoft.com/mssql/server:2025-latest`
+      with a random throwaway SA password and certificate, and run queries
+      through Envoy for each encryption mode, checking `encrypt_option` and
+      which filter chain took the connection; skips when Docker is unavailable:
+  - [x] `/opt/mssql-tools` sqlcmd (ODBC 17), default: login-only TLS
+  - [x] `/opt/mssql-tools18` sqlcmd (ODBC 18), `-N` mandatory with `-C`: full TLS
+  - [x] `/opt/mssql-tools18` sqlcmd `-N s`: TDS 8.0 strict, on the passthrough chain
   - [ ] Optional: go-mssqldb client (`~/playground/golang/sql/sql-test`)
-- [ ] The server test passes with the Phase 1 passthrough, and keeps passing after
+- [x] The server test passes with the Phase 1 passthrough, and keeps passing after
       every later phase
-- [ ] Fixtures from our own container: capture loopback traffic with tcpdump
-      during the server test, extract each direction's bytes with tshark into
-      `modules/mssql_proxy/testdata/`. All credentials in them are throwaway.
-      The PoC's pcaps (real logins, Kerberos tickets, real hosts) stay local
-      reference only and are never committed.
+
+  Found while building it: the SQL Server 2022 Linux image rejects strict
+  connections (error 17821) even with a configured certificate
+  (microsoft/mssql-docker#878); 2025 accepts them over TLS 1.2. Strict always
+  verifies the server certificate (`-C` is ignored), so the test trusts its
+  generated certificate via `SSL_CERT_FILE`. The ODBC driver matches the host
+  name against DNS SANs, so the certificate lists `127.0.0.1` as a DNS name, and
+  `tcp:localhost` does not connect at all with ODBC 18 here.
+- [ ] Fixtures from our own container: record the module chain's traffic with
+      Envoy's tap transport socket (`envoy.transport_sockets.tap`, in our
+      binary) during the server test, and convert each direction's bytes into
+      `modules/mssql_proxy/testdata/`. The tap needs no privileges (packet
+      capture needs the `wireshark` group or sudo) and records exactly what the
+      module sees, per direction. All credentials in the fixtures
+      are throwaway. The PoC's pcaps (real logins, Kerberos tickets, real hosts)
+      stay local reference only and are never committed.
 - [ ] Unit-test harness for module code that doesn't need Envoy (`cc_test` with `@googletest`, SDK fakes from `sdk_fake`)
-- [ ] Listener in `configs/mssql_proxy.yaml`: `tls_inspector`, a `tls` chain
+- [x] Listener in `configs/mssql_proxy.yaml`: `tls_inspector`, a `tls` chain
       with only `tcp_proxy`, and a `raw_buffer` chain with the module
 - [ ] Encryption state machine for TDS 7.x, driven by the PRELOGIN exchange:
   - [ ] Encryption on/required: TLS handshake carried in PRELOGIN packets, then
