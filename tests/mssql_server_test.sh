@@ -5,6 +5,10 @@
 #   ODBC 17 sqlcmd, default        -> login-only TLS   -> mssql_proxy chain
 #   ODBC 18 sqlcmd, -N mandatory   -> full TLS (TDS 7) -> mssql_proxy chain
 #   ODBC 18 sqlcmd, -N s strict    -> TDS 8.0          -> passthrough chain
+#   ODBC 17 sqlcmd, -a 512         -> login-only TLS   -> mssql_proxy chain
+#     (512-byte packets, which the module then enforces)
+#   ODBC 17 isql, MARS, Encrypt=no -> login-only TLS   -> mssql_proxy chain
+#     (skipped when unixODBC's isql is missing)
 #
 # Uses SQL Server 2025: the 2022 Linux image rejects TDS 8.0 strict connections
 # (error 17821) even with a configured certificate. Strict mode always verifies
@@ -131,7 +135,18 @@ stat() { curl -s http://127.0.0.1:9901/stats | sed -n "s/^$1: //p"; }
 module_cx() { stat "dynamicmodulescustom.mssql_proxy_connections_total" | grep . || echo 0; }
 strict_cx() { stat "tcp.mssql_strict.downstream_cx_total" | grep . || echo 0; }
 
-QUERY="SET NOCOUNT ON; SELECT encrypt_option FROM sys.dm_exec_connections WHERE session_id = @@SPID"
+QUERY="SET NOCOUNT ON; SELECT encrypt_option, net_transport FROM sys.dm_exec_connections WHERE session_id = @@SPID"
+
+# Clients, each running $QUERY and printing the result.
+sqlcmd_query() { "$@" -l 10 -h -1 -Q "$QUERY"; }
+isql_query() { echo "$QUERY" | isql -b -k "$1"; }
+# Negotiates 512-byte packets and pulls a result set many packets long, so the
+# module enforces the size the login response announced on real traffic.
+sqlcmd_small_packets() {
+  "$@" -a 512 -l 10 -h -1 -Q "SET NOCOUNT ON;
+    SELECT encrypt_option, net_packet_size FROM sys.dm_exec_connections WHERE session_id = @@SPID;
+    SELECT TOP 500 name FROM sys.all_objects"
+}
 
 # When recording, move the tap file of the connection that just closed to
 # $MSSQL_TAP_DIR/<name>.json. Envoy writes it on connection close.
@@ -146,15 +161,14 @@ save_tap() {
   mv "$f" "$MSSQL_TAP_DIR/$name.json"
 }
 
-# run_mode <name> <label> <expected encrypt_option> <expected chain: module|strict> <sqlcmd args...>
+# run_mode <name> <label> <output regex> <expected chain: module|strict> <client command...>
 run_mode() {
-  local name="$1" label="$2" want_enc="$3" want_chain="$4"
+  local name="$1" label="$2" want="$3" want_chain="$4"
   shift 4
   local m0 s0 out
   m0="$(module_cx)"; s0="$(strict_cx)"
-  out="$("$@" -l 10 -h -1 -Q "$QUERY" 2>&1)" || fail "$label: sqlcmd failed: $out"
-  [[ "$(echo "$out" | tr -d ' \r' | head -1)" == "$want_enc" ]] \
-    || fail "$label: expected encrypt_option $want_enc, got: $out"
+  out="$("$@" 2>&1)" || fail "$label: client failed: $out"
+  grep -Eq "$want" <<<"$out" || fail "$label: expected output matching '$want', got: $out"
   local dm=$(( $(module_cx) - m0 )) ds=$(( $(strict_cx) - s0 ))
   case "$want_chain" in
     module) [[ $dm -eq 1 && $ds -eq 0 ]] || fail "$label: expected module chain (module +$dm, strict +$ds)" ;;
@@ -164,17 +178,32 @@ run_mode() {
   echo "  ok: $label"
 }
 
-run_mode odbc17_login_only "ODBC 17, login-only TLS" FALSE module \
-  "$SQLCMD17" -S tcp:127.0.0.1,11433 -U sa
-run_mode odbc18_mandatory "ODBC 18, mandatory TLS" TRUE module \
-  "$SQLCMD18" -S tcp:127.0.0.1,11433 -U sa -N -C
-run_mode odbc18_strict "ODBC 18, TDS 8.0 strict" TRUE strict \
-  env SSL_CERT_FILE="$TMP/mssql.pem" "$SQLCMD18" -S tcp:127.0.0.1,11433 -U sa -N s
+run_mode odbc17_login_only "ODBC 17, login-only TLS" '^FALSE +TCP' module \
+  sqlcmd_query "$SQLCMD17" -S tcp:127.0.0.1,11433 -U sa
+run_mode odbc18_mandatory "ODBC 18, mandatory TLS" '^TRUE +TCP' module \
+  sqlcmd_query "$SQLCMD18" -S tcp:127.0.0.1,11433 -U sa -N -C
+run_mode odbc18_strict "ODBC 18, TDS 8.0 strict" '^TRUE +TCP' strict \
+  sqlcmd_query env SSL_CERT_FILE="$TMP/mssql.pem" "$SQLCMD18" -S tcp:127.0.0.1,11433 -U sa -N s
 
-# The module followed both TDS 7.x connections' encryption and found no errors.
+run_mode odbc17_small_packets "ODBC 17, 512-byte packets, login-only TLS" '^FALSE +512' module \
+  sqlcmd_small_packets "$SQLCMD17" -S tcp:127.0.0.1,11433 -U sa
+
+# MARS over login-only TLS, so the module sees the SMP packets after login.
+# sqlcmd can't enable MARS; unixODBC's isql can, through a connection string.
+login_only=2 mars=0
+if command -v isql >/dev/null; then
+  run_mode odbc17_mars "ODBC 17, MARS, login-only TLS" 'FALSE +\| +Session' module \
+    isql_query "Driver={ODBC Driver 17 for SQL Server};Server=tcp:127.0.0.1,11433;UID=sa;PWD=$SQLCMDPASSWORD;Encrypt=no;MARS_Connection=yes"
+  login_only=3 mars=1
+else
+  echo "  skip: MARS (isql from unixODBC not installed)"
+fi
+
+# The module followed every TDS 7.x connection's encryption and found no errors.
 module_stat() { stat "dynamicmodulescustom.mssql_proxy_$1" | grep . || echo 0; }
-[[ "$(module_stat encryption_login_only_total)" == 1 ]] || fail "login-only connection not recognised"
+[[ "$(module_stat encryption_login_only_total)" == "$login_only" ]] || fail "login-only connections not recognised"
 [[ "$(module_stat encryption_full_total)" == 1 ]] || fail "full-encryption connection not recognised"
+[[ "$(module_stat mars_connections_total)" == "$mars" ]] || fail "MARS connection not recognised"
 [[ "$(module_stat protocol_errors_total)" == 0 ]] || fail "protocol errors on real clients"
 [[ "$(module_stat unparsed_connections_total)" == 0 ]] || fail "real clients left unparsed"
 

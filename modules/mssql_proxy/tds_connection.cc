@@ -28,6 +28,11 @@ const char* directionName(Direction d) {
 // already suspicious.
 constexpr size_t kMaxPreloginMessage = kTdsMaxPacketSize;
 
+// A login takes a few server messages (SSPI rounds, then LOGINACK). Stop
+// looking for the packet size after this many, or beyond this size.
+constexpr size_t kMaxLoginMessages = 8;
+constexpr size_t kMaxLoginMessageSize = 64 * 1024;
+
 } // namespace
 
 ConnectionTracker::ConnectionTracker()
@@ -154,7 +159,7 @@ std::optional<std::string> ConnectionTracker::onLaterUnit(Direction d, const Uni
     }
     if (!client && mode_ == EncryptionMode::LoginOnly && other != Stage::Handshake) {
       stage = Stage::Plain; // The login response, after the client's encrypted LOGIN7.
-      return std::nullopt;
+      return onPlainServerUnit(unit);
     }
     return std::format("plain {} type 0x{:02x} during the TLS handshake",
                        unitKindName(unit.kind), unit.type);
@@ -175,7 +180,40 @@ std::optional<std::string> ConnectionTracker::onLaterUnit(Direction d, const Uni
       return std::format("raw TLS record in plain TDS under {} encryption",
                          encryptionModeName(mode_));
     }
+    return client ? std::nullopt : onPlainServerUnit(unit);
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string> ConnectionTracker::onPlainServerUnit(const Unit& unit) {
+  if (!scanning_login_ || unit.kind != UnitKind::TdsPacket || unit.type != kTdsTabularResult) {
     return std::nullopt;
+  }
+  if (login_message_.size() + unit.payload().size() > kMaxLoginMessageSize) {
+    scanning_login_ = false; // Too big to be a login response; stop looking.
+    login_message_.clear();
+    return std::nullopt;
+  }
+  login_message_.append(unit.payload());
+  if (!unit.eom) {
+    return std::nullopt;
+  }
+  std::string message = std::move(login_message_);
+  login_message_.clear();
+
+  std::string error;
+  std::optional<LoginResponseScan> scan = scanLoginResponse(message, error);
+  if (!scan) {
+    return "login response: " + error;
+  }
+  if (scan->packet_size) {
+    packet_size_ = scan->packet_size;
+    for (StreamSplitter& s : splitters_) {
+      s.setMaxTdsPacketSize(*packet_size_);
+    }
+  }
+  if (scan->login_ack || !scan->fully_scanned || ++login_messages_scanned_ >= kMaxLoginMessages) {
+    scanning_login_ = false;
   }
   return std::nullopt;
 }

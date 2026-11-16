@@ -51,7 +51,8 @@ struct Header {
 };
 
 // Returns nullopt when the header is incomplete; sets error when it is invalid.
-std::optional<Header> peekHeader(std::string_view b, bool mars, std::string& error) {
+std::optional<Header> peekHeader(std::string_view b, bool mars, size_t max_tds,
+                                 std::string& error) {
   const uint8_t first = static_cast<uint8_t>(b[0]);
   if (isTlsContentType(first)) {
     if (b.size() < kTlsHeaderSize) {
@@ -74,7 +75,7 @@ std::optional<Header> peekHeader(std::string_view b, bool mars, std::string& err
       return std::nullopt;
     }
     const size_t len = readLe32(b, 4);
-    if (len < kSmpHeaderSize || len > kSmpHeaderSize + kTdsMaxPacketSize) {
+    if (len < kSmpHeaderSize || len > kSmpHeaderSize + max_tds) {
       error = std::format("SMP packet length {} out of range", len);
       return std::nullopt;
     }
@@ -84,8 +85,9 @@ std::optional<Header> peekHeader(std::string_view b, bool mars, std::string& err
     return std::nullopt;
   }
   const size_t len = readBe16(b, 2);
-  if (len < kTdsHeaderSize || len > kTdsMaxPacketSize) {
-    error = std::format("TDS packet (type 0x{:02x}) length {} out of range", first, len);
+  if (len < kTdsHeaderSize || len > max_tds) {
+    error = std::format("TDS packet (type 0x{:02x}) length {} out of range (max {})", first, len,
+                        max_tds);
     return std::nullopt;
   }
   return Header{UnitKind::TdsPacket, first, (static_cast<uint8_t>(b[1]) & kTdsStatusEom) != 0,
@@ -104,7 +106,7 @@ std::optional<std::string> StreamSplitter::feed(std::string_view data, UnitSink&
   while (pos < buffer_.size()) {
     const std::string_view rest = std::string_view(buffer_).substr(pos);
     std::string error;
-    const std::optional<Header> h = peekHeader(rest, mars_enabled_, error);
+    const std::optional<Header> h = peekHeader(rest, mars_enabled_, max_tds_packet_, error);
     if (!error.empty()) {
       result = std::move(error);
       break;
@@ -174,6 +176,145 @@ std::optional<PreloginOptions> parsePrelogin(std::string_view payload, std::stri
     pos += 5;
   }
   return options;
+}
+
+namespace {
+
+uint16_t readLe16(std::string_view b, size_t at) {
+  return static_cast<uint16_t>(static_cast<uint8_t>(b[at]) | (static_cast<uint8_t>(b[at + 1]) << 8));
+}
+
+// ENVCHANGE data: Type BYTE, then for type 4 (packet size) NewValue and
+// OldValue as B_VARCHAR (char count BYTE, UTF-16LE chars) holding decimal text.
+std::optional<std::string> parseEnvChange(std::string_view data, LoginResponseScan& scan) {
+  constexpr uint8_t kEnvPacketSize = 4;
+  if (data.empty()) {
+    return "empty ENVCHANGE";
+  }
+  if (static_cast<uint8_t>(data[0]) != kEnvPacketSize) {
+    return std::nullopt;
+  }
+  if (data.size() < 2) {
+    return "ENVCHANGE packet size truncated";
+  }
+  const size_t chars = static_cast<uint8_t>(data[1]);
+  if (chars == 0 || chars > 5 || data.size() < 2 + 2 * chars) {
+    return std::format("ENVCHANGE packet size value of {} chars", chars);
+  }
+  uint32_t value = 0;
+  for (size_t i = 0; i < chars; ++i) {
+    const uint16_t c = readLe16(data, 2 + 2 * i);
+    if (c < '0' || c > '9') {
+      return "ENVCHANGE packet size is not a number";
+    }
+    value = value * 10 + (c - '0');
+  }
+  if (value < kTdsMinPacketSize || value > kTdsMaxPacketSize) {
+    return std::format("ENVCHANGE packet size {} out of range", value);
+  }
+  scan.packet_size = value;
+  return std::nullopt;
+}
+
+} // namespace
+
+std::optional<LoginResponseScan> scanLoginResponse(std::string_view payload, std::string& error) {
+  constexpr uint8_t kSspi = 0xed, kError = 0xaa, kInfo = 0xab, kLoginAck = 0xad,
+                    kEnvChange = 0xe3, kFeatureExtAck = 0xae, kSessionState = 0xe4,
+                    kFedAuthInfo = 0xee, kReturnStatus = 0x79, kDone = 0xfd, kDoneProc = 0xfe,
+                    kDoneInProc = 0xff;
+  constexpr size_t kDoneSize = 12; // Status, CurCmd, 8-byte row count (TDS 7.2+).
+
+  LoginResponseScan scan;
+  size_t pos = 0;
+  auto need = [&](size_t n, const char* what) {
+    if (payload.size() - pos < n) {
+      error = std::format("{} token truncated", what);
+      return false;
+    }
+    return true;
+  };
+  while (pos < payload.size()) {
+    const uint8_t token = static_cast<uint8_t>(payload[pos++]);
+    switch (token) {
+    case kSspi:
+    case kError:
+    case kInfo:
+    case kLoginAck:
+    case kEnvChange: {
+      if (!need(2, "USHORT-length")) {
+        return std::nullopt;
+      }
+      const size_t len = readLe16(payload, pos);
+      pos += 2;
+      if (!need(len, "USHORT-length")) {
+        return std::nullopt;
+      }
+      const std::string_view data = payload.substr(pos, len);
+      pos += len;
+      if (token == kLoginAck) {
+        scan.login_ack = true;
+      } else if (token == kEnvChange) {
+        if (auto e = parseEnvChange(data, scan)) {
+          error = std::move(*e);
+          return std::nullopt;
+        }
+      }
+      break;
+    }
+    case kSessionState:
+    case kFedAuthInfo: {
+      if (!need(4, "DWORD-length")) {
+        return std::nullopt;
+      }
+      const size_t len = readLe32(payload, pos);
+      pos += 4;
+      if (!need(len, "DWORD-length")) {
+        return std::nullopt;
+      }
+      pos += len;
+      break;
+    }
+    case kFeatureExtAck:
+      // (FeatureId BYTE, FeatureAckDataLen DWORD, data)*, then 0xFF.
+      while (true) {
+        if (!need(1, "FEATUREEXTACK")) {
+          return std::nullopt;
+        }
+        if (static_cast<uint8_t>(payload[pos++]) == 0xff) {
+          break;
+        }
+        if (!need(4, "FEATUREEXTACK")) {
+          return std::nullopt;
+        }
+        const size_t len = readLe32(payload, pos);
+        pos += 4;
+        if (!need(len, "FEATUREEXTACK")) {
+          return std::nullopt;
+        }
+        pos += len;
+      }
+      break;
+    case kReturnStatus:
+      if (!need(4, "RETURNSTATUS")) {
+        return std::nullopt;
+      }
+      pos += 4;
+      break;
+    case kDone:
+    case kDoneProc:
+    case kDoneInProc:
+      if (!need(kDoneSize, "DONE")) {
+        return std::nullopt;
+      }
+      pos += kDoneSize;
+      break;
+    default:
+      return scan; // Unknown token: its length can't be derived, stop here.
+    }
+  }
+  scan.fully_scanned = true;
+  return scan;
 }
 
 } // namespace MssqlProxy

@@ -127,13 +127,16 @@ TCP segment. An echo backend or hand-written packets would miss all three.
       (first byte `0x53`, 16-byte header) wrapping TDS; recognise them and pass
       through opaquely. Parse SMP only if a later phase needs post-login
       inspection. (Unit-tested only.)
-- [ ] A real MARS client in the server test (sqlcmd doesn't use MARS; e.g.
-      ODBC with `MARS_Connection=yes`, or go-mssqldb), with encryption none or
-      login-only so SMP is visible to the module
+- [x] A real MARS client in the server test: unixODBC `isql` with ODBC 17,
+      `MARS_Connection=yes;Encrypt=no` (login-only, so SMP is visible to the
+      module), recorded as `testdata/odbc17_mars.tds`
 - [x] Packet size: hard cap at the TDS maximum (32767)
-- [ ] Follow the ENVCHANGE packet-size token in the login response when it is
-      visible (plaintext); needs a token-stream parser, shared with Phase 5's
-      login-response parsing
+- [x] Follow the ENVCHANGE packet-size token in the login response when it is
+      visible (encryption none or login-only): `scanLoginResponse` walks the
+      login tokens (SSPI, ERROR, INFO, LOGINACK, ENVCHANGE, FEATUREEXTACK,
+      SESSIONSTATE, FEDAUTHINFO, RETURNSTATUS, DONE) and stops quietly at any
+      other token; Phase 5 builds on it. Server test negotiates 512-byte packets
+      and pulls a multi-packet result through the enforced limit.
 
 Kerberos and NTLM need a domain controller; they are tested in Phase 5.
 

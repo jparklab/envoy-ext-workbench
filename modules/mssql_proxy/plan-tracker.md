@@ -13,4 +13,8 @@ Progress log against plan.md.
 
 - [x] 2026-11-16: listener split with `tls_inspector`; `tests/mssql_server_test.sh` passes for ODBC 17 login-only TLS, ODBC 18 mandatory TLS (module chain) and ODBC 18 strict (passthrough chain) against SQL Server 2025; `scripts/test.sh` 3/3
 - [x] 2026-11-16: fixtures recorded through Envoy's tap (`testdata/record.sh`); `:tds` library (unit splitter, PRELOGIN parser, encryption-mode tracker) with 27 unit tests including fixture replay at chunk sizes 1..1000; wired into the filter (observe-only, closes on protocol errors); server test checks the module saw login-only and full encryption with no errors; `scripts/test.sh` runs unit tests too
-- [ ] Next: real MARS client test; ENVCHANGE packet size (token-stream parser)
+- [x] 2026-11-16: real MARS client (isql, ODBC 17) through the module, recorded as a fixture; login-response token scan learns the negotiated packet size and the splitter enforces it; server test adds 512-byte-packet and MARS modes; 37 unit tests; Phase 2 complete
+
+## Phase 3: PRELOGIN and TLS
+
+- [ ] Next up

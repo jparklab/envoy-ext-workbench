@@ -74,6 +74,10 @@ public:
   // that 0x53 is just an unknown TDS packet type.
   void setMarsEnabled(bool enabled) { mars_enabled_ = enabled; }
 
+  // Largest TDS packet accepted: the TDS maximum until the login negotiates a
+  // packet size. SMP packets may carry one TDS packet plus their own header.
+  void setMaxTdsPacketSize(size_t size) { max_tds_packet_ = size; }
+
   // Feeds the next bytes. Calls sink.onUnit for every unit completed by them.
   // Returns an error message on malformed framing or when the sink stops; the
   // splitter is then unusable.
@@ -84,6 +88,7 @@ public:
 private:
   std::string buffer_;
   bool mars_enabled_ = false;
+  size_t max_tds_packet_ = kTdsMaxPacketSize;
   bool failed_ = false;
 };
 
@@ -105,5 +110,22 @@ struct PreloginOptions {
 // headers removed). Every offset and length is bounds-checked.
 // Returns nullopt and sets error on malformed input.
 std::optional<PreloginOptions> parsePrelogin(std::string_view payload, std::string& error);
+
+// Smallest and largest packet size a login can negotiate (MS-TDS 2.2.6.4).
+inline constexpr uint32_t kTdsMinPacketSize = 512;
+
+// What a scan of one server message during login found.
+struct LoginResponseScan {
+  bool login_ack = false;              // LOGINACK token present: login succeeded.
+  std::optional<uint32_t> packet_size; // From ENVCHANGE type 4 (packet size).
+  bool fully_scanned = false;          // False when an unknown token stopped the scan.
+};
+
+// Walks the tokens of a server message (TDS type 0x04 payload) sent during
+// login: SSPI, ERROR, INFO, LOGINACK, ENVCHANGE, FEATUREEXTACK, SESSIONSTATE,
+// FEDAUTHINFO, RETURNSTATUS and DONE tokens. Stops quietly at any other token,
+// since token lengths can't be derived generically. Returns nullopt and sets
+// error when a known token is malformed.
+std::optional<LoginResponseScan> scanLoginResponse(std::string_view payload, std::string& error);
 
 } // namespace MssqlProxy

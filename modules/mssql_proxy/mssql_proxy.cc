@@ -31,6 +31,7 @@ struct Metrics {
   MetricID encryption_none = 0;
   MetricID encryption_login_only = 0;
   MetricID encryption_full = 0;
+  MetricID mars_connections = 0;
 };
 
 class MssqlProxyFilter : public NetworkFilter {
@@ -103,6 +104,9 @@ private:
     case EncryptionMode::Unknown:
       break;
     }
+    if (tracker_.marsEnabled()) {
+      handle_.incrementCounterValue(metrics_.mars_connections, 1);
+    }
     DYM_LOG(handle_, LogLevel::Debug, "mssql_proxy: connection {} encryption {}, MARS {}",
             handle_.getConnectionId(), MssqlProxy::encryptionModeName(mode),
             tracker_.marsEnabled());
@@ -141,6 +145,7 @@ public:
     metrics.encryption_none = counter("mssql_proxy_encryption_none_total");
     metrics.encryption_login_only = counter("mssql_proxy_encryption_login_only_total");
     metrics.encryption_full = counter("mssql_proxy_encryption_full_total");
+    metrics.mars_connections = counter("mssql_proxy_mars_connections_total");
     return std::make_unique<MssqlProxyFilterFactory>(metrics);
   }
 };

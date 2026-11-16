@@ -56,6 +56,9 @@ public:
   bool parsing() const { return !passive_; }
   EncryptionMode encryptionMode() const { return mode_; }
   bool marsEnabled() const { return mars_; }
+  // Packet size the login negotiated, when the login response was visible
+  // (encryption none or login-only); TDS packets above it are then rejected.
+  std::optional<uint32_t> packetSize() const { return packet_size_; }
   const DirectionStats& stats(Direction d) const { return stats_[index(d)]; }
 
 private:
@@ -86,6 +89,7 @@ private:
   std::optional<std::string> onPreloginUnit(Direction d, const Unit& unit);
   std::optional<std::string> onPreloginMessage(Direction d, std::string_view payload);
   std::optional<std::string> onLaterUnit(Direction d, const Unit& unit);
+  std::optional<std::string> onPlainServerUnit(const Unit& unit);
 
   std::array<StreamSplitter, 2> splitters_;
   std::array<Sink, 2> sinks_;
@@ -96,6 +100,11 @@ private:
   EncryptionMode mode_ = EncryptionMode::Unknown;
   bool mars_ = false;
   bool passive_ = false;
+  // Scanning the server's plain login messages for LOGINACK and the packet size.
+  bool scanning_login_ = true;
+  size_t login_messages_scanned_ = 0;
+  std::string login_message_; // Server message being assembled while scanning.
+  std::optional<uint32_t> packet_size_;
 };
 
 } // namespace MssqlProxy

@@ -198,6 +198,59 @@ TEST(Prelogin, RejectsMalformed) {
   EXPECT_FALSE(parsePrelogin(preloginPayload(0x05), error)) << "unknown value";
 }
 
+// ---------------------------------------------------------------- login response
+
+std::string le16(size_t v) {
+  return std::string{static_cast<char>(v & 0xff), static_cast<char>((v >> 8) & 0xff)};
+}
+
+std::string bVarchar(std::string_view ascii) {
+  std::string s(1, static_cast<char>(ascii.size()));
+  for (char c : ascii) {
+    s.push_back(c);
+    s.push_back(0);
+  }
+  return s;
+}
+
+std::string envChangePacketSize(std::string_view new_value, std::string_view old_value) {
+  const std::string data = std::string(1, 4) + bVarchar(new_value) + bVarchar(old_value);
+  return std::string(1, static_cast<char>(0xe3)) + le16(data.size()) + data;
+}
+
+std::string loginAck() {
+  const std::string data(10, 'x');
+  return std::string(1, static_cast<char>(0xad)) + le16(data.size()) + data;
+}
+
+std::string done() { return std::string(1, static_cast<char>(0xfd)) + std::string(12, '\0'); }
+
+TEST(LoginResponse, FindsPacketSizeAndLoginAck) {
+  std::string error;
+  auto scan = scanLoginResponse(loginAck() + envChangePacketSize("8192", "4096") + done(), error);
+  ASSERT_TRUE(scan) << error;
+  EXPECT_TRUE(scan->login_ack);
+  EXPECT_EQ(scan->packet_size, 8192u);
+  EXPECT_TRUE(scan->fully_scanned);
+}
+
+TEST(LoginResponse, StopsAtUnknownToken) {
+  std::string error;
+  auto scan = scanLoginResponse(envChangePacketSize("1024", "4096") + "\x81" + "rest", error);
+  ASSERT_TRUE(scan) << error;
+  EXPECT_EQ(scan->packet_size, 1024u);
+  EXPECT_FALSE(scan->fully_scanned);
+}
+
+TEST(LoginResponse, RejectsMalformed) {
+  std::string error;
+  EXPECT_FALSE(scanLoginResponse(loginAck().substr(0, 5), error)) << "truncated token";
+  EXPECT_FALSE(scanLoginResponse(envChangePacketSize("40x6", "4096"), error)) << "not a number";
+  EXPECT_FALSE(scanLoginResponse(envChangePacketSize("100", "4096"), error)) << "below 512";
+  EXPECT_FALSE(scanLoginResponse(envChangePacketSize("40000", "4096"), error)) << "above 32767";
+  EXPECT_FALSE(scanLoginResponse(done().substr(0, 6), error)) << "short DONE";
+}
+
 // ---------------------------------------------------------------- tracker
 
 std::string clientPrelogin(uint8_t enc, std::optional<uint8_t> mars = std::nullopt) {
@@ -215,6 +268,22 @@ TEST(ConnectionTracker, NoEncryption) {
   ASSERT_FALSE(t.onClientData(tdsPacket(kTdsLogin7, true, "login")));
   ASSERT_FALSE(t.onServerData(tdsPacket(kTdsTabularResult, true, "loginack")));
   EXPECT_TRUE(t.onClientData(tlsRecord(0x17, "x"))) << "no TLS when none negotiated";
+}
+
+TEST(ConnectionTracker, EnforcesNegotiatedPacketSize) {
+  ConnectionTracker t;
+  ASSERT_FALSE(t.onClientData(clientPrelogin(0x02)));
+  ASSERT_FALSE(t.onServerData(serverPrelogin(0x02)));
+  ASSERT_FALSE(t.onClientData(tdsPacket(kTdsLogin7, true, "login")));
+  // The login response arrives in two packets; the size applies once it ends.
+  const std::string response = loginAck() + envChangePacketSize("512", "4096") + done();
+  ASSERT_FALSE(t.onServerData(tdsPacket(kTdsTabularResult, false, response.substr(0, 9))));
+  EXPECT_FALSE(t.packetSize());
+  ASSERT_FALSE(t.onServerData(tdsPacket(kTdsTabularResult, true, response.substr(9))));
+  EXPECT_EQ(t.packetSize(), 512u);
+
+  ASSERT_FALSE(t.onClientData(tdsPacket(kTdsSqlBatch, true, std::string(512 - 8, 'a'))));
+  EXPECT_TRUE(t.onClientData(tdsPacket(kTdsSqlBatch, true, std::string(512 - 7, 'a'))));
 }
 
 TEST(ConnectionTracker, PreloginSplitAcrossPackets) {
@@ -349,6 +418,7 @@ TEST_P(FixtureReplay, Odbc17LoginOnly) {
   EXPECT_GE(c.tls_records, 1u) << "LOGIN7 travels as raw TLS";
   EXPECT_EQ(s.tls_records, 0u) << "the server answers in plain TDS";
   EXPECT_GE(c.tds_messages, 4u) << "PRELOGIN, handshake, then plain SQL batches";
+  EXPECT_EQ(t.packetSize(), 4096u) << "from the plaintext login response";
 }
 
 TEST_P(FixtureReplay, Odbc18Mandatory) {
@@ -359,6 +429,19 @@ TEST_P(FixtureReplay, Odbc18Mandatory) {
   EXPECT_EQ(t.encryptionMode(), EncryptionMode::Full);
   EXPECT_GE(t.stats(Direction::ClientToServer).tls_records, 1u);
   EXPECT_GE(t.stats(Direction::ServerToClient).tls_records, 1u);
+  EXPECT_FALSE(t.packetSize()) << "the login response is encrypted";
+}
+
+TEST_P(FixtureReplay, Odbc17Mars) {
+  const auto events = loadFixture("odbc17_mars");
+  ConnectionTracker t;
+  replay(t, events, GetParam());
+  EXPECT_TRUE(t.parsing());
+  EXPECT_EQ(t.encryptionMode(), EncryptionMode::LoginOnly);
+  EXPECT_TRUE(t.marsEnabled());
+  // SYN, DATA..., FIN from the client; DATA back from the server.
+  EXPECT_GE(t.stats(Direction::ClientToServer).smp_packets, 3u);
+  EXPECT_GE(t.stats(Direction::ServerToClient).smp_packets, 1u);
 }
 
 INSTANTIATE_TEST_SUITE_P(Chunks, FixtureReplay, ::testing::Values(0, 1, 3, 7, 64, 1000));
