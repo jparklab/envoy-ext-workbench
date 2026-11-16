@@ -12,4 +12,5 @@ Progress log against plan.md.
 ## Phase 2: TDS framer (test-first)
 
 - [x] 2026-11-16: listener split with `tls_inspector`; `tests/mssql_server_test.sh` passes for ODBC 17 login-only TLS, ODBC 18 mandatory TLS (module chain) and ODBC 18 strict (passthrough chain) against SQL Server 2025; `scripts/test.sh` 3/3
-- [ ] Next: fixtures via Envoy's tap transport socket, then the framer
+- [x] 2026-11-16: fixtures recorded through Envoy's tap (`testdata/record.sh`); `:tds` library (unit splitter, PRELOGIN parser, encryption-mode tracker) with 27 unit tests including fixture replay at chunk sizes 1..1000; wired into the filter (observe-only, closes on protocol errors); server test checks the module saw login-only and full encryption with no errors; `scripts/test.sh` runs unit tests too
+- [ ] Next: real MARS client test; ENVCHANGE packet size (token-stream parser)

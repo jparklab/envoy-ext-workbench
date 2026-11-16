@@ -13,8 +13,12 @@
 # throwaway and generated per run.
 #
 # Skips (exit 0) when Docker or the mssql-tools sqlcmd binaries are missing.
-# Needs: scripts/build-envoy.sh and scripts/build-modules.sh already run, openssl.
-# Override the image with MSSQL_IMAGE.
+# Needs: scripts/build-envoy.sh and scripts/build-modules.sh already run,
+# openssl, python3 with PyYAML. Override the image with MSSQL_IMAGE.
+#
+# Set MSSQL_TAP_DIR=<dir> to also record each module-chain connection with
+# Envoy's tap transport socket, as <dir>/<mode>.json (see
+# modules/mssql_proxy/testdata/record.sh).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -76,9 +80,45 @@ for _ in $(seq 120); do
 done
 [[ -n "$ready" ]] || fail "SQL Server did not become ready"
 
-sed "s/port_value: 1433 }/port_value: $port }/" \
-  "$REPO_ROOT/configs/mssql_proxy.yaml" >"$TMP/envoy.yaml"
-grep -q "port_value: $port }" "$TMP/envoy.yaml" || fail "could not rewrite backend port"
+# Copy the config with the container's port, and with the tap on the module
+# chain when recording.
+TAP_TMP=""
+if [[ -n "${MSSQL_TAP_DIR:-}" ]]; then
+  mkdir -p "$MSSQL_TAP_DIR" "$TMP/tap"
+  TAP_TMP="$TMP/tap"
+fi
+python3 -I - "$REPO_ROOT/configs/mssql_proxy.yaml" "$TMP/envoy.yaml" "$port" "$TAP_TMP" <<'EOF' \
+  || fail "could not write the Envoy config"
+import sys, yaml
+src, dst, port, tap_dir = sys.argv[1:]
+cfg = yaml.safe_load(open(src))
+res = cfg["static_resources"]
+ep = res["clusters"][0]["load_assignment"]["endpoints"][0]["lb_endpoints"][0]["endpoint"]
+ep["address"]["socket_address"]["port_value"] = int(port)
+if tap_dir:
+    chain = next(c for c in res["listeners"][0]["filter_chains"]
+                 if c["filter_chain_match"]["transport_protocol"] == "raw_buffer")
+    chain["transport_socket"] = {
+        "name": "envoy.transport_sockets.tap",
+        "typed_config": {
+            "@type": "type.googleapis.com/envoy.extensions.transport_sockets.tap.v3.Tap",
+            "common_config": {"static_config": {
+                "match": {"any_match": True},
+                "output_config": {
+                    "max_buffered_rx_bytes": 1 << 20,
+                    "max_buffered_tx_bytes": 1 << 20,
+                    "sinks": [{"format": "JSON_BODY_AS_BYTES",
+                               "file_per_tap": {"path_prefix": tap_dir + "/conn"}}],
+                },
+            }},
+            "transport_socket": {
+                "name": "envoy.transport_sockets.raw_buffer",
+                "typed_config": {"@type": "type.googleapis.com/envoy.extensions.transport_sockets.raw_buffer.v3.RawBuffer"},
+            },
+        },
+    }
+yaml.safe_dump(cfg, open(dst, "w"), sort_keys=False)
+EOF
 "$REPO_ROOT/scripts/run.sh" "$TMP/envoy.yaml" --log-path "$TMP/envoy.log" &
 envoy_pid=$!
 for _ in $(seq 50); do
@@ -93,10 +133,23 @@ strict_cx() { stat "tcp.mssql_strict.downstream_cx_total" | grep . || echo 0; }
 
 QUERY="SET NOCOUNT ON; SELECT encrypt_option FROM sys.dm_exec_connections WHERE session_id = @@SPID"
 
-# run_mode <label> <expected encrypt_option> <expected chain: module|strict> <sqlcmd args...>
+# When recording, move the tap file of the connection that just closed to
+# $MSSQL_TAP_DIR/<name>.json. Envoy writes it on connection close.
+save_tap() {
+  local name="$1" f=""
+  for _ in $(seq 50); do
+    f="$(ls "$TAP_TMP"/conn_*.json 2>/dev/null | head -1)"
+    [[ -n "$f" ]] && break
+    sleep 0.1
+  done
+  [[ -n "$f" ]] || fail "$name: no tap file recorded"
+  mv "$f" "$MSSQL_TAP_DIR/$name.json"
+}
+
+# run_mode <name> <label> <expected encrypt_option> <expected chain: module|strict> <sqlcmd args...>
 run_mode() {
-  local label="$1" want_enc="$2" want_chain="$3"
-  shift 3
+  local name="$1" label="$2" want_enc="$3" want_chain="$4"
+  shift 4
   local m0 s0 out
   m0="$(module_cx)"; s0="$(strict_cx)"
   out="$("$@" -l 10 -h -1 -Q "$QUERY" 2>&1)" || fail "$label: sqlcmd failed: $out"
@@ -107,14 +160,22 @@ run_mode() {
     module) [[ $dm -eq 1 && $ds -eq 0 ]] || fail "$label: expected module chain (module +$dm, strict +$ds)" ;;
     strict) [[ $dm -eq 0 && $ds -eq 1 ]] || fail "$label: expected strict chain (module +$dm, strict +$ds)" ;;
   esac
+  [[ -n "$TAP_TMP" && "$want_chain" == module ]] && save_tap "$name"
   echo "  ok: $label"
 }
 
-run_mode "ODBC 17, login-only TLS" FALSE module \
+run_mode odbc17_login_only "ODBC 17, login-only TLS" FALSE module \
   "$SQLCMD17" -S tcp:127.0.0.1,11433 -U sa
-run_mode "ODBC 18, mandatory TLS" TRUE module \
+run_mode odbc18_mandatory "ODBC 18, mandatory TLS" TRUE module \
   "$SQLCMD18" -S tcp:127.0.0.1,11433 -U sa -N -C
-run_mode "ODBC 18, TDS 8.0 strict" TRUE strict \
+run_mode odbc18_strict "ODBC 18, TDS 8.0 strict" TRUE strict \
   env SSL_CERT_FILE="$TMP/mssql.pem" "$SQLCMD18" -S tcp:127.0.0.1,11433 -U sa -N s
+
+# The module followed both TDS 7.x connections' encryption and found no errors.
+module_stat() { stat "dynamicmodulescustom.mssql_proxy_$1" | grep . || echo 0; }
+[[ "$(module_stat encryption_login_only_total)" == 1 ]] || fail "login-only connection not recognised"
+[[ "$(module_stat encryption_full_total)" == 1 ]] || fail "full-encryption connection not recognised"
+[[ "$(module_stat protocol_errors_total)" == 0 ]] || fail "protocol errors on real clients"
+[[ "$(module_stat unparsed_connections_total)" == 0 ]] || fail "real clients left unparsed"
 
 echo "PASS: mssql_server_test"

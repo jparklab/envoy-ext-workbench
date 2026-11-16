@@ -1,7 +1,11 @@
 #!/usr/bin/env bash
 # Starts Envoy with configs/mssql_proxy.yaml pointed at a local TCP echo server
-# instead of SQL Server, and checks that bytes pass through the mssql_proxy
-# module unchanged and that its counters move.
+# instead of SQL Server, and checks the mssql_proxy module's edge cases that a
+# real server can't easily produce:
+# - a connection that doesn't open with PRELOGIN passes through unchanged and
+#   is counted as unparsed;
+# - a malformed PRELOGIN gets the connection closed and counted as an error.
+# Real client traffic is covered by mssql_server_test.sh.
 # Needs: scripts/build-envoy.sh and scripts/build-modules.sh already run, python3.
 set -euo pipefail
 
@@ -45,25 +49,41 @@ for _ in $(seq 50); do
   sleep 0.2
 done
 
-# Send a TDS-shaped PRELOGIN header plus payload; expect the same bytes back.
-reply="$(python3 -I - <<'EOF'
-import socket
-payload = bytes([0x12, 0x01, 0x00, 0x0c, 0, 0, 1, 0]) + b"ping"
-with socket.create_connection(("127.0.0.1", 11433), timeout=5) as s:
+# exchange <hex bytes to send>: prints the hex of everything echoed back
+# before the connection closes or 2s pass.
+exchange() {
+  python3 -I - "$1" <<'EOF'
+import socket, sys
+payload = bytes.fromhex(sys.argv[1])
+got = b""
+with socket.create_connection(("127.0.0.1", 11433), timeout=2) as s:
     s.sendall(payload)
-    got = b""
-    while len(got) < len(payload):
-        chunk = s.recv(65536)
-        if not chunk:
-            break
-        got += chunk
-print("ok" if got == payload else "mismatch: " + got.hex())
+    try:
+        while len(got) < len(payload):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            got += chunk
+    except (socket.timeout, ConnectionResetError):
+        pass
+print(got.hex())
 EOF
-)"
-[[ "$reply" == ok ]] || fail "passthrough: $reply"
+}
+counter() {
+  curl -s http://127.0.0.1:9901/stats | sed -n "s/^dynamicmodulescustom\.mssql_proxy_$1: //p"
+}
 
-stats="$(curl -s http://127.0.0.1:9901/stats)"
-for c in connections_total downstream_rx_bytes_total upstream_rx_bytes_total; do
-  grep -Eq "mssql_proxy_${c}: [1-9]" <<<"$stats" || fail "counter mssql_proxy_${c} not incremented"
-done
+# A complete SQLBatch packet as the first message: not a TDS 7.x login, so the
+# module stops parsing and passes it through unchanged.
+batch="0101001000000100""73656c6563742031"
+[[ "$(exchange "$batch")" == "$batch" ]] || fail "non-PRELOGIN connection not passed through"
+[[ "$(counter unparsed_connections_total)" == 1 ]] || fail "unparsed connection not counted"
+
+# A PRELOGIN whose option table is truncated: the module closes the connection
+# before anything reaches the backend, so nothing is echoed.
+bad_prelogin="1201000c00000100""70696e67"
+[[ -z "$(exchange "$bad_prelogin")" ]] || fail "malformed PRELOGIN was passed through"
+[[ "$(counter protocol_errors_total)" == 1 ]] || fail "protocol error not counted"
+
+[[ "$(counter connections_total)" == 2 ]] || fail "connections not counted"
 echo "PASS: mssql_proxy_test"

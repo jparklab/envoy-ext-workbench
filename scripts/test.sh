@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Build the modules, then run every tests/*_test.sh against the built Envoy.
+# Build the modules, run their unit tests, then every tests/*_test.sh against
+# the built Envoy.
 # Usage: scripts/test.sh [test-name ...]   e.g. scripts/test.sh add_header_test
 set -euo pipefail
 
@@ -10,6 +11,9 @@ if [[ ! -x "$REPO_ROOT/envoy/bazel-bin/source/exe/envoy-static" ]]; then
   exit 1
 fi
 "$REPO_ROOT/scripts/build-modules.sh" >/dev/null
+
+# Unit tests of module code (cc_test targets under modules/).
+"$REPO_ROOT/scripts/bazel.sh" test @workbench//... --test_output=errors
 
 if [[ $# -gt 0 ]]; then
   tests=()

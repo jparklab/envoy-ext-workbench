@@ -97,7 +97,7 @@ TCP segment. An echo backend or hand-written packets would miss all three.
   generated certificate via `SSL_CERT_FILE`. The ODBC driver matches the host
   name against DNS SANs, so the certificate lists `127.0.0.1` as a DNS name, and
   `tcp:localhost` does not connect at all with ODBC 18 here.
-- [ ] Fixtures from our own container: record the module chain's traffic with
+- [x] Fixtures from our own container (`testdata/record.sh`): record the module chain's traffic with
       Envoy's tap transport socket (`envoy.transport_sockets.tap`, in our
       binary) during the server test, and convert each direction's bytes into
       `modules/mssql_proxy/testdata/`. The tap needs no privileges (packet
@@ -105,28 +105,35 @@ TCP segment. An echo backend or hand-written packets would miss all three.
       module sees, per direction. All credentials in the fixtures
       are throwaway. The PoC's pcaps (real logins, Kerberos tickets, real hosts)
       stay local reference only and are never committed.
-- [ ] Unit-test harness for module code that doesn't need Envoy (`cc_test` with `@googletest`, SDK fakes from `sdk_fake`)
+- [x] Unit-test harness for module code that doesn't need Envoy: `:tds` library
+      and `tds_test` (`cc_test` with `@googletest`), run by `scripts/test.sh`
 - [x] Listener in `configs/mssql_proxy.yaml`: `tls_inspector`, a `tls` chain
       with only `tcp_proxy`, and a `raw_buffer` chain with the module
-- [ ] Encryption state machine for TDS 7.x, driven by the PRELOGIN exchange:
-  - [ ] Encryption on/required: TLS handshake carried in PRELOGIN packets, then
+- [x] Encryption state machine for TDS 7.x, driven by the PRELOGIN exchange:
+  - [x] Encryption on/required: TLS handshake carried in PRELOGIN packets, then
         raw TLS records (not TDS-framed) passed through untouched
-  - [ ] Encryption off (login-only TLS): same handshake, LOGIN7 as TLS records,
+  - [x] Encryption off (login-only TLS): same handshake, LOGIN7 as TLS records,
         then plain TDS packets resume
-  - [ ] Encryption not supported on either side: plain TDS throughout
-- [ ] 8-byte header parse; reassemble across split reads
-- [ ] Multi-packet messages up to EOM; several packets in one read
-- [ ] Reject lengths < 8 or > negotiated packet size
-- [ ] Framer unit tests run on the captured fixtures as well as hand-built cases
-- [ ] Wire the framer into onRead/onWrite, still forwarding bytes unchanged; done
+  - [x] Encryption not supported on either side: plain TDS throughout
+        (unit-tested only; none of the test clients produces it)
+- [x] 8-byte header parse; reassemble across split reads
+- [x] Multi-packet messages up to EOM; several packets in one read
+- [x] Reject TDS lengths < 8 or > 32767, TLS records > 2^14 + 2048, bad SMP lengths
+- [x] Framer unit tests run on the captured fixtures as well as hand-built cases
+- [x] Wire the framer into onRead/onWrite, still forwarding bytes unchanged; done
       only when every encryption mode in the server test still passes
 
-- [ ] MARS: when PRELOGIN negotiates it, the post-login stream is SMP packets
+- [x] MARS: when PRELOGIN negotiates it, the post-login stream is SMP packets
       (first byte `0x53`, 16-byte header) wrapping TDS; recognise them and pass
       through opaquely. Parse SMP only if a later phase needs post-login
-      inspection.
-- [ ] Packet size: hard cap at the TDS maximum (32767); follow the ENVCHANGE
-      packet-size token in the login response when it is visible (plaintext)
+      inspection. (Unit-tested only.)
+- [ ] A real MARS client in the server test (sqlcmd doesn't use MARS; e.g.
+      ODBC with `MARS_Connection=yes`, or go-mssqldb), with encryption none or
+      login-only so SMP is visible to the module
+- [x] Packet size: hard cap at the TDS maximum (32767)
+- [ ] Follow the ENVCHANGE packet-size token in the login response when it is
+      visible (plaintext); needs a token-stream parser, shared with Phase 5's
+      login-response parsing
 
 Kerberos and NTLM need a domain controller; they are tested in Phase 5.
 
