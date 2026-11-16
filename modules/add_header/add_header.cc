@@ -1,4 +1,4 @@
-// Starter HTTP filter for the workbench module.
+// add_header: starter dynamic module with one HTTP filter.
 //
 // Filter name "add_header": adds the response header `x-workbench` with the
 // filter_config string as its value (default "hello"). Replace it with real

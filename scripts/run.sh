@@ -16,7 +16,7 @@ if [[ ! -f "$CONFIG" ]]; then
   exit 1
 fi
 
-# Where Envoy looks for lib<name>.so dynamic modules; build-module.sh writes here.
-export ENVOY_DYNAMIC_MODULES_SEARCH_PATH="${ENVOY_DYNAMIC_MODULES_SEARCH_PATH:-$REPO_ROOT/build/module}"
+# Where Envoy looks for lib<name>.so dynamic modules; build-modules.sh writes here.
+export ENVOY_DYNAMIC_MODULES_SEARCH_PATH="${ENVOY_DYNAMIC_MODULES_SEARCH_PATH:-$REPO_ROOT/build/modules}"
 
 exec "$ENVOY_BIN" -c "$CONFIG" "${@:2}"

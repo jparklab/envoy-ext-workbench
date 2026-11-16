@@ -1,6 +1,6 @@
-# Same as envoy.yaml, plus the workbench dynamic module's "add_header" filter.
-# Envoy loads ${ENVOY_DYNAMIC_MODULES_SEARCH_PATH}/libworkbench.so; scripts/run.sh
-# points that at build/module by default.
+# Same as envoy.yaml, plus the add_header dynamic module's "add_header" filter.
+# Envoy loads ${ENVOY_DYNAMIC_MODULES_SEARCH_PATH}/libadd_header.so; scripts/run.sh
+# points that at build/modules by default.
 admin:
   address:
     socket_address: { address: 127.0.0.1, port_value: 9901 }
@@ -26,11 +26,11 @@ static_resources:
                   status: 200
                   body: { inline_string: "ok\n" }
           http_filters:
-          - name: workbench.add_header
+          - name: add_header
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_modules.v3.DynamicModuleFilter
               dynamic_module_config:
-                name: workbench
+                name: add_header
               filter_name: add_header
               filter_config:
                 "@type": type.googleapis.com/google.protobuf.StringValue

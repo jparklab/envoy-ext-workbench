@@ -7,9 +7,9 @@ submodule for building and testing.
 
 ```
 envoy/      git submodule, pinned to Envoy v1.40.2
-module/     dynamic module source (C++ SDK, CMake), builds build/module/libworkbench.so
-configs/    Envoy configs: envoy.yaml (plain), module.yaml (loads the module)
-scripts/    build-envoy.sh, build-module.sh, run.sh, test.sh
+modules/    dynamic modules (C++ SDK, CMake), one directory per module
+configs/    Envoy configs: envoy.yaml (plain), <module>.yaml (loads that module)
+scripts/    build-envoy.sh, build-modules.sh, run.sh, test.sh
 tests/      *_test.sh integration tests against the built Envoy
 ```
 
@@ -29,19 +29,27 @@ scripts/run.sh                         # serves "ok" on :10000, admin on 127.0.0
 curl localhost:10000
 ```
 
-## Dynamic module
+## Dynamic modules
 
-`module/` uses the C++ SDK from `envoy/source/extensions/dynamic_modules/sdk/cpp`,
-compiled straight from the submodule with CMake and the system clang (C++20).
-The starter filter `add_header` sets an `x-workbench` response header to its
+Each directory under `modules/` is one module, built into
+`build/modules/lib<name>.so` and loaded by Envoy as
+`dynamic_module_config: { name: <name> }`. Modules use the C++ SDK from
+`envoy/source/extensions/dynamic_modules/sdk/cpp`, compiled once from the
+submodule with CMake and the system clang (C++20).
+
+The starter module `add_header` sets an `x-workbench` response header to its
 `filter_config` string.
 
 ```sh
-scripts/build-module.sh                # -> build/module/libworkbench.so
-scripts/run.sh configs/module.yaml     # sets ENVOY_DYNAMIC_MODULES_SEARCH_PATH=build/module
-curl -i localhost:10000                # x-workbench: from-workbench
-scripts/test.sh                        # builds the module, runs tests/*_test.sh
+scripts/build-modules.sh                  # all modules; or: scripts/build-modules.sh add_header
+scripts/run.sh configs/add_header.yaml    # sets ENVOY_DYNAMIC_MODULES_SEARCH_PATH=build/modules
+curl -i localhost:10000                   # x-workbench: from-workbench
+scripts/test.sh                           # builds modules, runs tests/*_test.sh
 ```
+
+To add a module `foo`: create `modules/foo/foo.cc` and
+`modules/foo/CMakeLists.txt` containing `envoy_dynamic_module(foo foo.cc)`,
+then add `configs/foo.yaml` and `tests/foo_test.sh`.
 
 Envoy checks a hash of the module ABI header at load time, so build the module
 from the same submodule commit as the Envoy binary.
