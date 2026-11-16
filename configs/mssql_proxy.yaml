@@ -1,0 +1,38 @@
+# TCP listener on :11433 running the mssql_proxy dynamic module in front of
+# tcp_proxy. The backend is 127.0.0.1:1433 (a local SQL Server, e.g. the
+# mcr.microsoft.com/mssql/server container).
+# Envoy loads ${ENVOY_DYNAMIC_MODULES_SEARCH_PATH}/libmssql_proxy.so.
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }
+
+static_resources:
+  listeners:
+  - name: mssql
+    address:
+      socket_address: { address: 0.0.0.0, port_value: 11433 }
+    filter_chains:
+    - filters:
+      - name: mssql_proxy
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.dynamic_modules.v3.DynamicModuleNetworkFilter
+          dynamic_module_config:
+            name: mssql_proxy
+          filter_name: mssql_proxy
+      - name: envoy.filters.network.tcp_proxy
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+          stat_prefix: mssql
+          cluster: mssql_backend
+
+  clusters:
+  - name: mssql_backend
+    connect_timeout: 5s
+    type: STATIC
+    load_assignment:
+      cluster_name: mssql_backend
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address: { address: 127.0.0.1, port_value: 1433 }
