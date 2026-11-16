@@ -7,9 +7,9 @@ submodule for building and testing.
 
 ```
 envoy/      git submodule, pinned to Envoy v1.40.2
-modules/    dynamic modules (C++ SDK, CMake), one directory per module
+modules/    dynamic modules (C++ SDK, Bazel repo @workbench), one directory per module
 configs/    Envoy configs: envoy.yaml (plain), <module>.yaml (loads that module)
-scripts/    build-envoy.sh, build-modules.sh, run.sh, test.sh
+scripts/    bazel.sh, build-envoy.sh, build-modules.sh, run.sh, test.sh
 tests/      *_test.sh integration tests against the built Envoy
 ```
 
@@ -34,8 +34,14 @@ curl localhost:10000
 Each directory under `modules/` is one module, built into
 `build/modules/lib<name>.so` and loaded by Envoy as
 `dynamic_module_config: { name: <name> }`. Modules use the C++ SDK from
-`envoy/source/extensions/dynamic_modules/sdk/cpp`, compiled once from the
-submodule with CMake and the system clang (C++20).
+`envoy/source/extensions/dynamic_modules/sdk/cpp`.
+
+Modules build with Bazel inside the `envoy/` workspace: `scripts/bazel.sh` runs
+Bazel there with `modules/` injected as the external repository `@workbench`.
+So modules use Envoy's toolchain and flags, can depend on any repository Envoy
+already has (`@boringssl//:ssl`, `@googletest//:gtest_main`, abseil, ...), and
+reuse the Envoy build's cache. Run any Bazel command through it, e.g.
+`scripts/bazel.sh test @workbench//...`.
 
 The starter module `add_header` sets an `x-workbench` response header to its
 `filter_config` string.
@@ -47,8 +53,18 @@ curl -i localhost:10000                   # x-workbench: from-workbench
 scripts/test.sh                           # builds modules, runs tests/*_test.sh
 ```
 
-To add a module `foo`: create `modules/foo/foo.cc` and
-`modules/foo/CMakeLists.txt` containing `envoy_dynamic_module(foo foo.cc)`,
+To add a module `foo`: create `modules/foo/foo.cc` and `modules/foo/BUILD`:
+
+```starlark
+load("//:defs.bzl", "envoy_dynamic_module")
+
+envoy_dynamic_module(
+    name = "foo",
+    srcs = ["foo.cc"],
+    deps = [],  # e.g. "@boringssl//:ssl"; linked statically into libfoo.so
+)
+```
+
 then add `configs/foo.yaml` and `tests/foo_test.sh`.
 
 Envoy checks a hash of the module ABI header at load time, so build the module

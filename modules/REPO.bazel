@@ -1,0 +1,2 @@
+# modules/ is the Bazel repository @workbench, injected into the envoy/ workspace
+# by scripts/bazel.sh. See defs.bzl for the module rule.
