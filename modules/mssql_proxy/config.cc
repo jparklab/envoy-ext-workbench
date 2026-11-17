@@ -156,6 +156,93 @@ std::optional<RoutingConfig> parseRouting(const Json& routing, std::string& erro
   return config;
 }
 
+// A keytab path at key, checked readable now (reread on use).
+std::optional<std::string> keytabFile(const Json& object, std::string_view where,
+                                      bool required, const FileReader& read_file,
+                                      std::string& error) {
+  std::optional<std::string> path = getString(object, "keytab_file", where, error);
+  if (!path) {
+    if (error.empty() && required) {
+      error = std::format("{}.keytab_file is required", where);
+    }
+    return std::nullopt;
+  }
+  if (!read_file(*path, error)) {
+    error = std::format("{}.keytab_file: {}", where, error);
+    return std::nullopt;
+  }
+  return path;
+}
+
+bool parseUpstream(const Json& upstream, const FileReader& read_file, KerberosConfig& config,
+                   std::string& error) {
+  constexpr std::string_view kWhere = "auth.kerberos.upstream";
+  if (!upstream.is_object()) {
+    error = "auth.kerberos.upstream must be an object";
+    return false;
+  }
+  if (!checkKeys(upstream, kWhere, {"identity", "keytab_file", "principal", "spn", "cluster_spns"},
+                 error)) {
+    return false;
+  }
+  std::optional<std::string> identity = getString(upstream, "identity", kWhere, error);
+  if (!identity) {
+    if (error.empty()) {
+      error = "auth.kerberos.upstream.identity is required";
+    }
+    return false;
+  }
+  if (*identity != "service_account" && *identity != "delegate") {
+    error = "auth.kerberos.upstream.identity must be \"service_account\" or \"delegate\"";
+    return false;
+  }
+  config.delegate = *identity == "delegate";
+  if (config.delegate) {
+    for (const char* key : {"keytab_file", "principal"}) {
+      if (upstream.contains(key)) {
+        error = std::format("auth.kerberos.upstream.{} is for service_account (delegate logs in "
+                            "as the client, with auth.kerberos.keytab_file's principal asking "
+                            "for constrained delegation)",
+                            key);
+        return false;
+      }
+    }
+  } else {
+    std::optional<std::string> keytab = keytabFile(upstream, kWhere, true, read_file, error);
+    if (!keytab) {
+      return false;
+    }
+    config.client_keytab_path = *keytab;
+  }
+  if (auto principal = getString(upstream, "principal", kWhere, error)) {
+    config.principal = *principal;
+  } else if (!error.empty()) {
+    return false;
+  }
+  std::optional<std::string> spn = getString(upstream, "spn", kWhere, error);
+  if (!spn) {
+    if (error.empty()) {
+      error = "auth.kerberos.upstream.spn is required";
+    }
+    return false;
+  }
+  config.spn = *spn;
+  if (auto it = upstream.find("cluster_spns"); it != upstream.end()) {
+    if (!it->is_object()) {
+      error = "auth.kerberos.upstream.cluster_spns must be an object";
+      return false;
+    }
+    for (const auto& [cluster, value] : it->items()) {
+      if (!value.is_string() || value.get_ref<const std::string&>().empty()) {
+        error = "auth.kerberos.upstream.cluster_spns values must be non-empty strings";
+        return false;
+      }
+      config.cluster_spns.emplace_back(cluster, value.get<std::string>());
+    }
+  }
+  return true;
+}
+
 std::optional<KerberosConfig> parseKerberos(const Json& kerberos, const FileReader& read_file,
                                             std::string& error) {
   constexpr std::string_view kWhere = "auth.kerberos";
@@ -163,7 +250,8 @@ std::optional<KerberosConfig> parseKerberos(const Json& kerberos, const FileRead
     error = "auth.kerberos must be an object";
     return std::nullopt;
   }
-  if (!checkKeys(kerberos, kWhere, {"mode", "keytab_file"}, error)) {
+  if (!checkKeys(kerberos, kWhere, {"mode", "keytab_file", "channel_binding", "upstream"},
+                 error)) {
     return std::nullopt;
   }
   std::optional<std::string> mode = getString(kerberos, "mode", kWhere, error);
@@ -173,22 +261,45 @@ std::optional<KerberosConfig> parseKerberos(const Json& kerberos, const FileRead
     }
     return std::nullopt;
   }
-  if (*mode != "read_ticket") {
-    error = "auth.kerberos.mode must be \"read_ticket\"";
+  if (*mode != "read_ticket" && *mode != "terminate") {
+    error = "auth.kerberos.mode must be \"read_ticket\" or \"terminate\"";
     return std::nullopt;
   }
-  std::optional<std::string> keytab = getString(kerberos, "keytab_file", kWhere, error);
+  KerberosConfig config;
+  config.terminate = *mode == "terminate";
+  std::optional<std::string> keytab = keytabFile(kerberos, kWhere, true, read_file, error);
   if (!keytab) {
-    if (error.empty()) {
-      error = "auth.kerberos.keytab_file is required";
+    return std::nullopt;
+  }
+  config.keytab_path = *keytab;
+  if (!config.terminate) {
+    for (const char* key : {"channel_binding", "upstream"}) {
+      if (kerberos.contains(key)) {
+        error = std::format("auth.kerberos.{} is for mode terminate", key);
+        return std::nullopt;
+      }
     }
+    return config;
+  }
+  if (auto binding = getString(kerberos, "channel_binding", kWhere, error)) {
+    if (*binding == "tls_server_end_point") {
+      config.channel_binding = ChannelBinding::TlsServerEndPoint;
+    } else if (*binding != "none") {
+      error = "auth.kerberos.channel_binding must be \"none\" or \"tls_server_end_point\"";
+      return std::nullopt;
+    }
+  } else if (!error.empty()) {
     return std::nullopt;
   }
-  if (!read_file(*keytab, error)) { // Readable now; reread on use.
-    error = "auth.kerberos.keytab_file: " + error;
+  auto upstream = kerberos.find("upstream");
+  if (upstream == kerberos.end()) {
+    error = "auth.kerberos.upstream is required with mode terminate";
     return std::nullopt;
   }
-  return KerberosConfig{*keytab};
+  if (!parseUpstream(*upstream, read_file, config, error)) {
+    return std::nullopt;
+  }
+  return config;
 }
 
 std::optional<AuthSettings> parseAuth(const Json& auth, std::string& error) {

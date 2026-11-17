@@ -171,13 +171,85 @@ TEST(Config, Kerberos) {
   EXPECT_EQ(selectRoute(*config->routing, login, ""), nullptr) << "no principal: no match";
 }
 
+TEST(Config, KerberosTerminate) {
+  const FileReader keytabs = files({{"/c.pem", "CERT"},
+                                    {"/k.pem", "KEY"},
+                                    {"/ca.pem", "CA"},
+                                    {"/proxy.keytab", "KT"},
+                                    {"/client.keytab", "KT"}});
+  std::string error;
+  auto config = parseFilterConfig(std::format(R"({{{}, "auth": {{"kerberos": {{
+      "mode": "terminate", "keytab_file": "/proxy.keytab",
+      "channel_binding": "tls_server_end_point",
+      "upstream": {{"identity": "service_account", "keytab_file": "/client.keytab",
+                    "principal": "svc@TEST.REALM", "spn": "MSSQLSvc/sql.test:1433",
+                    "cluster_spns": {{"b": "MSSQLSvc/b.test:1433"}}}}}}}}}})",
+                                              kTls),
+                                  keytabs, error);
+  ASSERT_TRUE(config) << error;
+  const KerberosConfig& k = *config->kerberos;
+  EXPECT_TRUE(k.terminate);
+  EXPECT_FALSE(k.delegate);
+  EXPECT_EQ(k.keytab_path, "/proxy.keytab");
+  EXPECT_EQ(k.client_keytab_path, "/client.keytab");
+  EXPECT_EQ(k.principal, "svc@TEST.REALM");
+  EXPECT_EQ(k.spn, "MSSQLSvc/sql.test:1433");
+  ASSERT_EQ(k.cluster_spns.size(), 1u);
+  EXPECT_EQ(k.cluster_spns[0].second, "MSSQLSvc/b.test:1433");
+  EXPECT_EQ(k.channel_binding, ChannelBinding::TlsServerEndPoint);
+
+  config = parseFilterConfig(std::format(R"({{{}, "auth": {{"kerberos": {{
+      "mode": "terminate", "keytab_file": "/proxy.keytab",
+      "upstream": {{"identity": "delegate", "spn": "MSSQLSvc/sql.test:1433"}}}}}}}})",
+                                         kTls),
+                             keytabs, error);
+  ASSERT_TRUE(config) << error;
+  EXPECT_TRUE(config->kerberos->delegate);
+  EXPECT_TRUE(config->kerberos->client_keytab_path.empty());
+  EXPECT_EQ(config->kerberos->channel_binding, ChannelBinding::None);
+}
+
+TEST(Config, RejectsBadKerberosTerminate) {
+  const FileReader keytabs =
+      files({{"/c.pem", "CERT"}, {"/k.pem", "KEY"}, {"/ca.pem", "CA"}, {"/p.keytab", "KT"}});
+  auto terminate = [](std::string_view rest) {
+    return std::format(R"({{{}, "auth": {{"kerberos": {{"mode": "terminate",
+        "keytab_file": "/p.keytab"{}}}}}}})",
+                       kTls, rest);
+  };
+  const std::map<std::string, std::string> cases = {
+      {terminate(""), "upstream is required"},
+      {terminate(R"(, "upstream": {"spn": "s"})"), "identity is required"},
+      {terminate(R"(, "upstream": {"identity": "proxy", "spn": "s"})"), "\"delegate\""},
+      {terminate(R"(, "upstream": {"identity": "service_account", "spn": "s"})"),
+       "upstream.keytab_file is required"},
+      {terminate(R"(, "upstream": {"identity": "delegate"})"), "spn is required"},
+      {terminate(R"(, "upstream": {"identity": "delegate", "spn": "s", "principal": "p"})"),
+       "principal is for service_account"},
+      {terminate(R"(, "upstream": {"identity": "delegate", "spn": "s", "keytab_file": "/p.keytab"})"),
+       "keytab_file is for service_account"},
+      {terminate(R"(, "upstream": {"identity": "delegate", "spn": "s", "cluster_spns": []})"),
+       "cluster_spns must be an object"},
+      {terminate(R"(, "channel_binding": "tls_unique", "upstream": {"identity": "delegate", "spn": "s"})"),
+       "channel_binding must be"},
+      {std::format(R"({{{}, "auth": {{"kerberos": {{"mode": "read_ticket", "keytab_file": "/p.keytab",
+          "upstream": {{}}}}}}}})", kTls),
+       "upstream is for mode terminate"},
+  };
+  for (const auto& [json, want] : cases) {
+    std::string error;
+    EXPECT_FALSE(parseFilterConfig(json, keytabs, error)) << json;
+    EXPECT_NE(error.find(want), std::string::npos) << json << " -> " << error;
+  }
+}
+
 TEST(Config, RejectsBadAuth) {
   const std::map<std::string, std::string> cases = {
       {R"({"auth": {}})", "auth needs tls"},
       {std::format(R"({{{}, "auth": []}})", kTls), "auth must be an object"},
       {std::format(R"({{{}, "auth": {{"kerberos": {{}}}}}})", kTls), "mode is required"},
-      {std::format(R"({{{}, "auth": {{"kerberos": {{"mode": "terminate"}}}}}})", kTls),
-       "must be \"read_ticket\""},
+      {std::format(R"({{{}, "auth": {{"kerberos": {{"mode": "relay"}}}}}})", kTls),
+       "must be \"read_ticket\" or \"terminate\""},
       {std::format(R"({{{}, "auth": {{"kerberos": {{"mode": "read_ticket"}}}}}})", kTls),
        "keytab_file is required"},
       {std::format(R"({{{}, "auth": {{"kerberos": {{"mode": "read_ticket",

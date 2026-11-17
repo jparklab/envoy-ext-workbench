@@ -412,39 +412,72 @@ The client's ticket never reaches the server, so the proxy keeps its replay cach
 on and there is no sharing problem.
 
 Client leg:
-- [ ] `gss_accept_sec_context` with the proxy's keytab
-      (`gss_acquire_cred_from`, no process environment), SPNEGO
-- [ ] Channel binding: pass `tls-server-end-point` of the proxy's certificate,
-      so clients that bind are checked rather than broken
-- [ ] Answer the client: drop the server's SSPI token from the login response
-      and put the proxy's (AP-REP) in its place, re-framing the TDS message
-- [ ] NTLM-only clients: relay per `ntlm` (pass_through) or deny
+- [x] `gss_accept_sec_context` with the proxy's keytab
+      (`gss_acquire_cred_from`, no process environment), SPNEGO or bare
+      Kerberos; rounds with the client answered locally (SSPI token, then the
+      client's SSPI packet); the accepted principal goes through the deny list
+      and the `principal` route key before the server is contacted
+- [x] Channel binding: `channel_binding: tls_server_end_point` passes each
+      leg's certificate hash (RFC 5929), so clients that bind are checked; off
+      by default, since which binding SQL Server and its drivers use is
+      unverified (open questions). Clients that don't bind still log in
+- [x] Answer the client: the server's SSPI token is dropped from the login
+      response and the proxy's (AP-REP) put in its place, the message
+      re-framed (the server's SPID kept)
+- [x] NTLM-only clients: relay per `ntlm` (pass_through) or deny; SQL logins
+      pass through; integrated logins without SSPI data are refused
 
 Server leg:
-- [ ] `identity: delegate`: with an acceptor credential that can also initiate,
-      MIT returns the client's ticket as evidence for S4U2Proxy (constrained
-      delegation, Kerberos-only); `gss_init_sec_context` for the backend SPN with
-      it. SQL Server sees the end user. Needs AD to let the proxy account
-      delegate to the backend SPNs (or RBCD on them) and forwardable tickets
-- [ ] `identity: service_account`: `gss_init_sec_context` with the proxy's own
+- [x] `identity: delegate`: the TGT the client forwarded (delegation flag);
+      otherwise S4U2Proxy, with an acceptor credential that also initiates
+      (`GSS_C_BOTH`, the same keytab) so MIT keeps the client's ticket as
+      evidence, requested as the proxy's SPN principal with its own TGT (kept
+      fresh in the memory ccache). SQL Server sees the end user
+- [ ] S4U2Proxy that succeeds: needs a KDC that lets the proxy's account
+      delegate to the backend SPNs (AD constrained delegation or RBCD); the
+      throwaway MIT realm (DB2) can't, so the test sees the KDC refuse
+      (`KDC can't fulfill requested option`) and the proxy refuse the login
+- [x] `identity: service_account`: `gss_init_sec_context` with the proxy's own
       client keytab; SQL Server sees the proxy account, the proxy logs the user
-- [ ] Backend SPN from the routed cluster (`cluster_spns`, default `spn`)
-- [ ] Rewrite LOGIN7: replace the SSPI data, fix offsets and lengths (and
-      `cbSSPILong`); everything else as the client sent it
-- [ ] Channel binding toward the server: `tls-server-end-point` of the server's
-      certificate, so EPA *Required* works on this leg
-- [ ] Verify the server's AP-REP (mutual auth) before passing LOGINACK on
+- [x] Backend SPN from the routed cluster (`cluster_spns`, default `spn`)
+- [x] Rewrite LOGIN7: replace the SSPI data, fix offsets and lengths (and
+      `cbSSPILong`, and the FeatureExt pointer); everything else as the
+      client sent it
+- [x] Channel binding toward the server: `tls-server-end-point` of the
+      server's certificate (with `channel_binding`)
+- [x] Verify the server's AP-REP (mutual auth) before passing LOGINACK on; a
+      server that accepts without it is refused. Rounds with the server
+      answered locally
 
 Async: the GSS calls may contact the KDC (S4U2Proxy, service tickets) and block.
-- [ ] Run them on a module-owned worker pool; `readDisable` the connection while
-      a call is pending, resume through the filter's `getScheduler()` (both in
-      the v1.40.2 SDK); a connection closed meanwhile drops the result
-- [ ] Cache the proxy's TGT and service tickets in a per-config memory ccache
+- [x] Every GSS step runs on a module-owned worker pool (4 threads per filter
+      config); the bridge hands the step out and holds any data that arrives
+      meanwhile; the filter `readDisable`s the connection and resumes through
+      its `getScheduler()`; a connection closed meanwhile drops the result
+- [x] The proxy's TGT and service tickets cached in a memory ccache per
+      filter config (MIT renews them for service_account; the proxy renews
+      its TGT for delegate)
 
-- [ ] Tests: unit tests on the LOGIN7 rewrite and login-response substitution;
-      integration test with the throwaway realm (service_account against a SQL
-      Server set up for it; delegate where the KDC supports constrained
-      delegation, see open questions)
+- [x] Tests: unit tests on the LOGIN7 rewrite and SSPI token replacement; the
+      bridge with a scripted exchange in every encryption mode (rounds with
+      either side, refusals, missing mutual auth, server refusal, NTLM and
+      SQL logins passing, bindings, data held during a step); end to end
+      against the throwaway realm with real GSS on both sides
+      (service_account, delegate with a forwarded TGT, S4U2Proxy refused by
+      the KDC, a ticket for another service, a replayed login, channel
+      bindings right and wrong); the server test logs in with ODBC 17
+      through terminate, and the KDC log shows the proxy asking for the
+      server's ticket as its service account
+- [ ] Integration test where the server accepts the proxy's login: same need
+      as 5c (AD or Samba AD)
+
+Deployment: clients use the proxy's SPN (e.g. `ServerSPN=MSSQLSvc/proxy:1433`,
+or DNS pointing the server name at the proxy with that SPN registered to the
+proxy's account). With `service_account` every login reaches SQL Server as the
+proxy's account, so per-user permissions there are lost; the proxy's
+deny list and routing are the access control. With `delegate`, clients must
+forward their TGT, or the proxy's account must be trusted for constrained
+delegation to the backend SPNs.
 
 ### Later
 
@@ -484,9 +517,11 @@ Async: the GSS calls may contact the KDC (S4U2Proxy, service tickets) and block.
   plain MIT realm (no AD) via `mssql-conf` keytab; without a keytab it refuses
   with SSPI error 0x8009030e and "untrusted domain" (seen in the server test),
   and MIT tickets carry no PAC, so a successful login likely needs AD or Samba
-  AD; whether the MIT KDC (DB2 backend) can grant constrained
-  delegation for the `delegate` test, else Samba AD; whether SQL Server checks
-  Kerberos channel binding under EPA, and which binding it expects.
+  AD. The MIT KDC's DB2 backend can't grant constrained delegation (it refuses
+  S4U2Proxy with KDC_ERR_BADOPTION), so a successful S4U2Proxy test needs AD
+  or Samba AD. Whether SQL Server checks Kerberos channel binding under EPA,
+  and which binding it and the drivers use (`tls-server-end-point` is what
+  `channel_binding` offers; `tls-unique` is the other candidate).
 - Unverified from the handoff: MIT krb5 SPNEGO acceptance of Windows tokens; whether
   SQL Server checks the SPN on proxied logins; which drivers send the FEDAUTH
   channel binding token.

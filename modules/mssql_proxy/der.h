@@ -1,7 +1,7 @@
 #pragma once
 
 // A minimal, bounds-checked ASN.1 DER reader for the authentication messages
-// the proxy reads (SPNEGO, Kerberos). Only single-byte tags occur in them;
+// the proxy reads (SPNEGO, Kerberos), and an encoder for the few it writes. Only single-byte tags occur in them;
 // indefinite (BER) lengths are rejected. No Envoy dependency.
 
 #include <cstdint>
@@ -59,5 +59,8 @@ private:
 
 // A DER INTEGER's contents (two's complement, at most 8 bytes).
 std::optional<int64_t> derInteger(std::string_view contents, std::string& error);
+
+// One TLV: tag, definite length, contents.
+std::string derEncode(uint8_t tag, std::string_view contents);
 
 } // namespace MssqlProxy

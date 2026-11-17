@@ -38,15 +38,17 @@ cc_library(
     deps = [":tds"],
 )
 
-# Kerberos read_ticket with MIT Kerberos, linked statically.
+# Kerberos read_ticket and terminate with MIT Kerberos, linked statically.
 cc_library(
     name = "kerberos",
     srcs = [
         "kerberos.cc",
+        "kerberos_terminate.cc",
         "krb5_util.cc",
     ],
     hdrs = [
         "kerberos.h",
+        "kerberos_terminate.h",
         "krb5_util.h",
     ],
     # Kerberos symbols are hidden, so whatever calls them must be in the same
@@ -70,6 +72,12 @@ cc_library(
     ],
 )
 
+# Threads for work that may block (Kerberos steps); no Envoy dependency.
+cc_library(
+    name = "worker_pool",
+    hdrs = ["worker_pool.h"],
+)
+
 # filter_config parsing; no Envoy dependency.
 cc_library(
     name = "config",
@@ -90,6 +98,7 @@ envoy_dynamic_module(
         ":kerberos",
         ":tds",
         ":tls_bridge",
+        ":worker_pool",
     ],
 )
 
@@ -118,10 +127,22 @@ cc_test(
     ],
 )
 
+cc_library(
+    name = "bridge_test_util",
+    testonly = True,
+    hdrs = ["bridge_test_util.h"],
+    deps = [
+        ":test_util",
+        ":tls_bridge",
+        "@googletest//:gtest",
+    ],
+)
+
 cc_test(
     name = "tls_bridge_test",
     srcs = ["tls_bridge_test.cc"],
     deps = [
+        ":bridge_test_util",
         ":test_util",
         ":tls_bridge",
         "@googletest//:gtest_main",
@@ -138,6 +159,13 @@ cc_test(
     ],
 )
 
+cc_library(
+    name = "kdc_test_util",
+    testonly = True,
+    hdrs = ["kdc_test_util.h"],
+    deps = ["@googletest//:gtest"],
+)
+
 # Against a throwaway MIT KDC (testdata/mit_kdc.sh); skips without one.
 cc_test(
     name = "kerberos_test",
@@ -145,8 +173,25 @@ cc_test(
     data = ["testdata/mit_kdc.sh"],
     env = {"MIT_KDC": "$(rlocationpath testdata/mit_kdc.sh)"},
     deps = [
+        ":kdc_test_util",
         ":kerberos",
         ":test_util",
+        "@googletest//:gtest_main",
+    ],
+)
+
+# Kerberos terminate end to end through the bridge, against the throwaway KDC.
+cc_test(
+    name = "terminate_test",
+    srcs = ["terminate_test.cc"],
+    data = ["testdata/mit_kdc.sh"],
+    env = {"MIT_KDC": "$(rlocationpath testdata/mit_kdc.sh)"},
+    deps = [
+        ":bridge_test_util",
+        ":kdc_test_util",
+        ":kerberos",
+        ":test_util",
+        ":tls_bridge",
         "@googletest//:gtest_main",
     ],
 )

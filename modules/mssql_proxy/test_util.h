@@ -108,8 +108,11 @@ inline std::string der(uint8_t tag, std::string_view value) {
     out.push_back(static_cast<char>(n));
   } else if (n < 0x100) {
     out += {static_cast<char>(0x81), static_cast<char>(n)};
-  } else {
+  } else if (n < 0x10000) {
     out += {static_cast<char>(0x82), static_cast<char>(n >> 8), static_cast<char>(n & 0xff)};
+  } else {
+    out += {static_cast<char>(0x83), static_cast<char>(n >> 16), static_cast<char>((n >> 8) & 0xff),
+            static_cast<char>(n & 0xff)};
   }
   return out + std::string(value);
 }
@@ -212,6 +215,9 @@ struct Login7Fields {
   bool sspi_long = false; // Give its length in cbSSPILong (cbSSPI 0xFFFF).
   uint32_t tds_version = 0x74000004;
   uint32_t packet_size = 4096;
+  // FeatureExt data (fExtension): placed last, as drivers do, and pointed to
+  // by a DWORD between the server name and the library name.
+  std::string feature_ext;
 };
 
 // A TDS 7.4 LOGIN7 payload (94-byte fixed part, then the strings).
@@ -241,6 +247,14 @@ inline std::string login7Payload(const Login7Fields& f = {}) {
   str(44, f.password);
   str(48, f.app);
   str(52, f.server);
+  size_t feature_pointer = 0;
+  if (!f.feature_ext.empty()) {
+    fixed[27] = static_cast<char>(0x10); // fExtension
+    put16(56, kFixed + data.size());
+    put16(58, 4);
+    feature_pointer = data.size();
+    data += std::string(4, '\0');
+  }
   str(60, f.library);
   str(64, f.language);
   str(68, f.database);
@@ -252,6 +266,13 @@ inline std::string login7Payload(const Login7Fields& f = {}) {
     put16(80, f.sspi.size());
   }
   data += f.sspi;
+  if (!f.feature_ext.empty()) {
+    const size_t at = kFixed + data.size();
+    for (int i = 0; i < 4; ++i) {
+      data[feature_pointer + i] = static_cast<char>((at >> (8 * i)) & 0xff);
+    }
+    data += f.feature_ext;
+  }
   put32(0, static_cast<uint32_t>(kFixed + data.size()));
   return fixed + data;
 }

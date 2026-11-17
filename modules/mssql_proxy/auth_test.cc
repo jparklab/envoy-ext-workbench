@@ -1,6 +1,7 @@
 #include "auth.h"
 
 #include <string>
+#include <vector>
 
 #include "gss_token.h"
 #include "ntlm.h"
@@ -311,6 +312,98 @@ TEST(LoginAuth, SqlLoginIgnoresSspiPackets) {
   EXPECT_FALSE(auth.onLogin7(sqlLogin("app_user")));
   EXPECT_FALSE(auth.onClientSspi(ntlmAuthenticate()));
   EXPECT_EQ(auth.method(), LoginMethod::Sql);
+}
+
+TEST(AuthToken, CarriesTheMechanismToken) {
+  std::string error;
+  const std::string krb5 = krb5Token(0x0100, "AP-REQ");
+  auto token = parseAuthToken(spnegoInit({kOidKrb5}, krb5), error);
+  ASSERT_TRUE(token) << error;
+  EXPECT_EQ(token->mech_token, krb5);
+  token = parseAuthToken(krb5, error);
+  ASSERT_TRUE(token) << error;
+  EXPECT_EQ(token->mech_token, krb5) << "a bare token is its own";
+  token = parseAuthToken(spnegoInit({kOidKrb5}, std::nullopt), error);
+  ASSERT_TRUE(token) << error;
+  EXPECT_FALSE(token->mech_token);
+}
+
+TEST(AuthToken, WrapsTheProxysKerberosTokens) {
+  std::string error;
+  // Short and long tokens (DER lengths of one, two and three bytes).
+  for (size_t size : {10u, 200u, 70000u}) {
+    const std::string init = krb5Token(0x0100, std::string(size, 'q'));
+    const std::string wrapped_init = spnegoKerberosInit(init);
+    auto token = parseAuthToken(wrapped_init, error);
+    ASSERT_TRUE(token) << error;
+    EXPECT_TRUE(token->spnego);
+    EXPECT_EQ(token->offered, std::vector<AuthMechanism>{AuthMechanism::Kerberos});
+    EXPECT_EQ(token->mech_token, init);
+    EXPECT_EQ(token->krb5_tok_id, 0x0100);
+
+    const std::string later = krb5Token(0x0200, std::string(size, 'r'));
+    const std::string wrapped_later = spnegoResponse(later);
+    token = parseAuthToken(wrapped_later, error);
+    ASSERT_TRUE(token) << error;
+    EXPECT_EQ(token->mech_token, later);
+    EXPECT_EQ(token->krb5_tok_id, 0x0200);
+  }
+}
+
+std::shared_ptr<const AuthSettings> terminating(bool ntlm_allowed,
+                                                std::vector<std::string> deny = {}) {
+  AuthSettings s{.ntlm_allowed = ntlm_allowed, .deny = std::move(deny)};
+  s.terminate = KerberosTerminate{.spn = "MSSQLSvc/sql.test:1433",
+                                  .cluster_spns = {{"b", "MSSQLSvc/b.test:1433"}}};
+  return std::make_shared<const AuthSettings>(std::move(s));
+}
+
+TEST(LoginAuth, TerminatesKerberosAndUnknownMechanisms) {
+  LoginAuth kerberos(terminating(true));
+  EXPECT_FALSE(kerberos.onLogin7(integratedLogin(spnegoInit({kOidKrb5}, krb5Token()))));
+  EXPECT_TRUE(kerberos.terminating());
+  EXPECT_EQ(kerberos.identity(), "") << "known once the proxy accepts the client";
+
+  // The proxy accepts Kerberos only, so a mechanism it can't tell isn't
+  // refused as possible NTLM: its acceptor decides.
+  LoginAuth unknown(terminating(false));
+  EXPECT_FALSE(unknown.onLogin7(integratedLogin(spnegoInit({kOidKrb5}, std::nullopt))));
+  EXPECT_TRUE(unknown.terminating());
+
+  LoginAuth ntlm(terminating(true));
+  EXPECT_FALSE(ntlm.onLogin7(integratedLogin(spnegoInit({kOidNtlm}, ntlmMessage(1)))));
+  EXPECT_FALSE(ntlm.terminating()) << "NTLM passes through";
+  LoginAuth ntlm_denied(terminating(false));
+  EXPECT_TRUE(ntlm_denied.onLogin7(integratedLogin(ntlmMessage(1))));
+
+  LoginAuth sql(terminating(true));
+  EXPECT_FALSE(sql.onLogin7(sqlLogin("app_user")));
+  EXPECT_FALSE(sql.terminating());
+
+  LoginAuth no_token(terminating(true));
+  EXPECT_TRUE(no_token.onLogin7(integratedLogin(""))) << "the proxy must authenticate it";
+}
+
+TEST(LoginAuth, AcceptedPrincipalMeetsThePolicy) {
+  LoginAuth auth(terminating(true, {"bob@TEST.REALM"}));
+  ASSERT_FALSE(auth.onLogin7(integratedLogin(spnegoInit({kOidKrb5}, krb5Token()))));
+  EXPECT_FALSE(auth.onKerberosAccepted("alice@TEST.REALM"));
+  EXPECT_EQ(auth.method(), LoginMethod::Kerberos);
+  EXPECT_EQ(auth.identity(), "alice@TEST.REALM");
+  EXPECT_EQ(auth.kerberosPrincipal(), "alice@TEST.REALM");
+
+  LoginAuth bob(terminating(true, {"bob@TEST.REALM"}));
+  ASSERT_FALSE(bob.onLogin7(integratedLogin(spnegoInit({kOidKrb5}, krb5Token()))));
+  auto denial = bob.onKerberosAccepted("BOB@test.realm");
+  ASSERT_TRUE(denial);
+  EXPECT_EQ(denial->client_text, "Login failed for user 'BOB@test.realm'.");
+}
+
+TEST(LoginAuth, SpnPerCluster) {
+  const auto settings = terminating(true);
+  const KerberosTerminate& t = *settings->terminate;
+  EXPECT_EQ(t.spnFor("b"), "MSSQLSvc/b.test:1433");
+  EXPECT_EQ(t.spnFor("other"), "MSSQLSvc/sql.test:1433");
 }
 
 TEST(LoginAuth, Federated) {

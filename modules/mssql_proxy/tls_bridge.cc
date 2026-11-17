@@ -1,7 +1,9 @@
 #include "tls_bridge.h"
 
 #include <arpa/inet.h>
+#include <openssl/digest.h>
 #include <openssl/err.h>
+#include <openssl/obj.h>
 #include <openssl/pem.h>
 #include <openssl/x509.h>
 
@@ -29,6 +31,8 @@ constexpr size_t kMaxLoginMessages = 8;
 constexpr size_t kMaxLoginMessageSize = 64 * 1024;
 // A client SSPI message (MS-TDS caps the SSPI data of LOGIN7 alike).
 constexpr size_t kMaxSspiMessageSize = kMaxLogin7Size;
+// Data held while a Kerberos step runs (normally none: both peers wait).
+constexpr size_t kMaxHeldInput = 64 * 1024;
 // What SQL Server sends for a failed login: error 18456, state 1 (the state
 // clients see), severity 14.
 constexpr uint32_t kLoginFailedError = 18456;
@@ -52,6 +56,26 @@ BridgeError protocolError(std::string message) {
   return {BridgeError::Kind::Protocol, std::move(message)};
 }
 BridgeError tlsError(std::string message) { return {BridgeError::Kind::Tls, std::move(message)}; }
+
+// tls-server-end-point (RFC 5929): a hash of the certificate with its
+// signature's hash function, SHA-256 in place of MD5 and SHA-1.
+std::string tlsServerEndPoint(X509* cert) {
+  int digest_nid = NID_undef;
+  int pkey_nid = NID_undef;
+  const EVP_MD* md = nullptr;
+  if (OBJ_find_sigid_algs(X509_get_signature_nid(cert), &digest_nid, &pkey_nid)) {
+    md = EVP_get_digestbynid(digest_nid);
+  }
+  if (md == nullptr || digest_nid == NID_md5 || digest_nid == NID_sha1) {
+    md = EVP_sha256();
+  }
+  uint8_t hash[EVP_MAX_MD_SIZE];
+  unsigned int len = 0;
+  if (!X509_digest(cert, md, hash, &len)) {
+    return {};
+  }
+  return std::string(reinterpret_cast<const char*>(hash), len);
+}
 
 bssl::UniquePtr<BIO> memBio(const std::string& pem) {
   return bssl::UniquePtr<BIO>(BIO_new_mem_buf(pem.data(), static_cast<ptrdiff_t>(pem.size())));
@@ -190,7 +214,12 @@ TlsBridge::TlsBridge(std::shared_ptr<const TlsContexts> contexts, BridgeOptions 
                   Sink(*this, Direction::ServerToClient, false)},
       plain_sinks_{Sink(*this, Direction::ClientToServer, true),
                    Sink(*this, Direction::ServerToClient, true)},
-      auth_(options_.auth) {}
+      auth_(options_.auth) {
+  if (options_.auth && options_.auth->terminate) {
+    terminate_ = &*options_.auth->terminate;
+    upstream_spn_ = terminate_->spn;
+  }
+}
 
 std::optional<std::string> TlsBridge::Sink::onUnit(const Unit& unit) {
   std::optional<BridgeError> error = decrypted_ ? bridge_.onPlainUnit(direction_, unit)
@@ -209,6 +238,15 @@ std::optional<BridgeError> TlsBridge::feed(Direction d, std::string_view data,
   }
   if (passive_) {
     (d == Direction::ClientToServer ? out.to_server : out.to_client).append(data);
+    return std::nullopt;
+  }
+  if (waiting_) {
+    std::string& held = held_input_[index(d)];
+    if (held.size() + data.size() > kMaxHeldInput) {
+      return protocolError(
+          std::format("{}: too much data while the proxy's Kerberos step runs", sideName(d)));
+    }
+    held.append(data);
     return std::nullopt;
   }
   if (d == Direction::ClientToServer && !client_prelogin_) {
@@ -456,12 +494,15 @@ std::optional<BridgeError> TlsBridge::startLeg(Direction from) {
 
 std::optional<BridgeError> TlsBridge::serverReady() {
   server_ready_ = true;
-  if (pending_to_server_.empty()) {
-    return std::nullopt;
+  if (!pending_to_server_.empty()) {
+    std::string pending = std::move(pending_to_server_);
+    pending_to_server_.clear();
+    if (auto error = forward(Direction::ClientToServer, pending)) {
+      return error;
+    }
   }
-  std::string pending = std::move(pending_to_server_);
-  pending_to_server_.clear();
-  return forward(Direction::ClientToServer, pending);
+  maybeStartInitiate();
+  return std::nullopt;
 }
 
 std::optional<BridgeError> TlsBridge::driveHandshake(Direction from) {
@@ -540,14 +581,23 @@ std::optional<BridgeError> TlsBridge::decrypt(Direction from, std::string_view r
 }
 
 std::optional<BridgeError> TlsBridge::onPlainUnit(Direction d, const Unit& unit) {
+  const bool sspi = unit.kind == UnitKind::TdsPacket && unit.type == kTdsSspi;
+  const bool terminating = kerberos_ != Kerberos::Off && kerberos_ != Kerberos::Done;
   if (d == Direction::ClientToServer) {
     if (!login_) {
       return readLogin7(unit); // Forwards the message once complete and allowed.
     }
-    if (auth_.result() == LoginResult::Pending && unit.kind == UnitKind::TdsPacket &&
-        unit.type == kTdsSspi) {
+    if (terminating) {
+      if (kerberos_ == Kerberos::AwaitClient && sspi) {
+        return readClientSspi(unit);
+      }
+      return protocolError("client data during the proxy's Kerberos login");
+    }
+    if (auth_.result() == LoginResult::Pending && sspi) {
       return readClientSspi(unit);
     }
+  } else if (terminating) {
+    return onServerLoginUnit(unit);
   } else if (auto error = scanLoginMessage(unit)) {
     return error;
   }
@@ -568,14 +618,23 @@ std::optional<BridgeError> TlsBridge::readLogin7(const Unit& unit) {
     return std::nullopt;
   }
   std::string error;
-  login_ = parseLogin7(login7_message_, error);
+  std::string message = std::move(login7_message_);
   login7_message_.clear();
-  login7_message_.shrink_to_fit();
+  login_ = parseLogin7(message, error);
   if (!login_) {
     return protocolError(error);
   }
   if (std::optional<Denial> denial = auth_.onLogin7(*login_)) {
     return deny(*denial);
+  }
+  if (auth_.terminating()) {
+    // The proxy authenticates the client; the server gets this LOGIN7 later,
+    // with the proxy's own token.
+    login7_wire_.clear();
+    login7_payload_ = std::move(message);
+    exchange_ = terminate_->terminator->start();
+    startAccept(login_->sspi);
+    return std::nullopt;
   }
   if (!upstream_started_) {
     // Local PRELOGIN: the server hears from us now, before the held LOGIN7.
@@ -594,6 +653,13 @@ std::optional<BridgeError> TlsBridge::readClientSspi(const Unit& unit) {
   sspi_message_.append(unit.payload());
   sspi_wire_.append(unit.bytes);
   if (!unit.eom) {
+    return std::nullopt;
+  }
+  if (kerberos_ == Kerberos::AwaitClient) {
+    std::string token = std::move(sspi_message_);
+    sspi_message_.clear();
+    sspi_wire_.clear();
+    startAccept(token);
     return std::nullopt;
   }
   std::optional<Denial> denial = auth_.onClientSspi(sspi_message_);
@@ -647,6 +713,215 @@ std::optional<BridgeError> TlsBridge::scanLoginMessage(const Unit& unit) {
     scanning_login_ = false;
   }
   return std::nullopt;
+}
+
+std::optional<BridgeError> TlsBridge::resume(BridgeOutput& out) {
+  if (!waiting_ || work_ || !step_) {
+    return protocolError("resumed without a finished Kerberos step");
+  }
+  waiting_ = false;
+  KerberosExchange::Step step = std::move(*step_);
+  step_.reset();
+  out_ = &out;
+  std::optional<BridgeError> error = kerberos_ == Kerberos::Accepting
+                                         ? afterAccept(std::move(step))
+                                         : afterInitiate(std::move(step));
+  out_ = nullptr;
+  if (error) {
+    return error;
+  }
+  // What arrived meanwhile, unless another step is pending already.
+  for (Direction d : {Direction::ClientToServer, Direction::ServerToClient}) {
+    std::string held = std::exchange(held_input_[index(d)], std::string());
+    if (!held.empty()) {
+      if (waiting_) {
+        held_input_[index(d)] = std::move(held);
+        continue;
+      }
+      if (auto e = feed(d, held, out)) {
+        return e;
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+void TlsBridge::startAccept(std::string_view token) {
+  auto step = std::make_shared<KerberosExchange::Step>();
+  step_ = step;
+  work_ = [exchange = exchange_, step, token = std::string(token),
+           binding = channelBinding(kClient)] { *step = exchange->accept(token, binding); };
+  waiting_ = true;
+  kerberos_ = Kerberos::Accepting;
+}
+
+std::optional<BridgeError> TlsBridge::afterAccept(KerberosExchange::Step step) {
+  if (!step.error.empty()) {
+    return deny({"Kerberos login to the proxy failed: " + step.error, loginFailedMessage("")});
+  }
+  if (!step.complete) {
+    if (step.token.empty()) {
+      return deny({"Kerberos login to the proxy stalled", loginFailedMessage("")});
+    }
+    // Another round with the client, answered as the server would.
+    kerberos_ = Kerberos::AwaitClient;
+    return forward(Direction::ServerToClient,
+                   makeTdsMessage(kTdsTabularResult, sspiToken(step.token), kHandshakePacketSize));
+  }
+  client_final_token_ = std::move(step.token);
+  if (std::optional<Denial> denial = auth_.onKerberosAccepted(exchange_->clientPrincipal())) {
+    return deny(*denial);
+  }
+  kerberos_ = Kerberos::Accepted;
+  if (!upstream_started_) {
+    // Local PRELOGIN: the server hears from us now.
+    out_->to_server += upstream_prelogin_;
+    upstream_started_ = true;
+  }
+  maybeStartInitiate();
+  return std::nullopt;
+}
+
+void TlsBridge::maybeStartInitiate() {
+  if (kerberos_ == Kerberos::Accepted && server_ready_) {
+    startInitiate({});
+  }
+}
+
+void TlsBridge::startInitiate(std::string_view token) {
+  auto step = std::make_shared<KerberosExchange::Step>();
+  step_ = step;
+  work_ = [exchange = exchange_, step, token = std::string(token), spn = upstream_spn_,
+           binding = channelBinding(kServer)] {
+    *step = exchange->initiate(token, spn, binding);
+  };
+  waiting_ = true;
+  kerberos_ = kerberos_ == Kerberos::Accepted ? Kerberos::Initiating : Kerberos::Verifying;
+}
+
+std::optional<BridgeError> TlsBridge::afterInitiate(KerberosExchange::Step step) {
+  if (!step.error.empty()) {
+    return deny({"Kerberos login to the server failed: " + step.error,
+                 loginFailedMessage(auth_.identity())});
+  }
+  upstream_complete_ = step.complete;
+  if (kerberos_ == Kerberos::Initiating) {
+    if (step.token.empty()) {
+      return deny({"Kerberos login to the server failed: no token for the server",
+                   loginFailedMessage(auth_.identity())});
+    }
+    std::string error;
+    std::optional<std::string> login = replaceLogin7Sspi(login7_payload_, step.token, error);
+    if (!login) {
+      return protocolError(error);
+    }
+    login7_payload_.clear();
+    kerberos_ = Kerberos::AwaitServer;
+    return forward(Direction::ClientToServer,
+                   makeTdsMessage(kTdsLogin7, *login, kHandshakePacketSize));
+  }
+
+  // The server's SSPI token has been checked.
+  kerberos_ = Kerberos::AwaitServer;
+  std::string message = std::exchange(held_message_, std::string());
+  if (!held_scan_.login_ack && !held_scan_.error) {
+    // A round with the server: it waits for the proxy's next token.
+    if (!step.token.empty()) {
+      return forward(Direction::ClientToServer,
+                     makeTdsMessage(kTdsSspi, step.token, kHandshakePacketSize));
+    }
+    if (!step.complete) {
+      return deny({"Kerberos login to the server stalled", loginFailedMessage(auth_.identity())});
+    }
+  }
+  return finishServerMessage(message, held_scan_);
+}
+
+std::optional<BridgeError> TlsBridge::onServerLoginUnit(const Unit& unit) {
+  if (unit.kind != UnitKind::TdsPacket || unit.type != kTdsTabularResult) {
+    return protocolError(std::format("{} type 0x{:02x} during the proxy's Kerberos login",
+                                     unitKindName(unit.kind), unit.type));
+  }
+  if (kerberos_ != Kerberos::AwaitServer) {
+    return protocolError("server message before the proxy's Kerberos login reached it");
+  }
+  if (server_message_.empty() && unit.bytes.size() >= kTdsHeaderSize) {
+    server_spid_ = static_cast<uint16_t>((static_cast<uint8_t>(unit.bytes[4]) << 8) |
+                                         static_cast<uint8_t>(unit.bytes[5]));
+  }
+  if (server_message_.size() + unit.payload().size() > kMaxLoginMessageSize) {
+    return protocolError("server login message too large");
+  }
+  server_message_.append(unit.payload());
+  if (!unit.eom) {
+    return std::nullopt;
+  }
+  std::string message = std::exchange(server_message_, std::string());
+  if (++login_messages_scanned_ > kMaxLoginMessages) {
+    return protocolError("too many server messages during the Kerberos login");
+  }
+  std::string error;
+  std::optional<LoginResponseScan> scan = scanLoginResponse(message, error);
+  if (!scan) {
+    return protocolError("login response: " + error);
+  }
+  if (scan->packet_size) {
+    packet_size_ = scan->packet_size;
+    setMaxPacketSize(*packet_size_);
+  }
+  if (scan->sspi && !upstream_complete_) {
+    held_message_ = std::move(message);
+    held_scan_ = std::move(*scan);
+    startInitiate(*held_scan_.sspi);
+    return std::nullopt;
+  }
+  return finishServerMessage(message, *scan);
+}
+
+std::optional<BridgeError> TlsBridge::finishServerMessage(const std::string& message,
+                                                          const LoginResponseScan& scan) {
+  if (scan.login_ack && !upstream_complete_) {
+    return deny({"SQL Server accepted the login without authenticating itself (mutual "
+                 "authentication)",
+                 loginFailedMessage(auth_.identity())});
+  }
+  auth_.onServerLoginMessage(scan);
+  // The client gets the proxy's last token in place of the server's, which
+  // was meant for the proxy.
+  std::string payload =
+      replaceSspiTokens(message, scan, scan.login_ack ? client_final_token_ : std::string());
+  if (scan.login_ack || scan.error) {
+    kerberos_ = Kerberos::Done;
+    scanning_login_ = false;
+    client_final_token_.clear();
+  }
+  if (payload.empty()) {
+    return std::nullopt;
+  }
+  return forward(Direction::ServerToClient,
+                 makeTdsMessage(kTdsTabularResult, payload, kHandshakePacketSize, server_spid_));
+}
+
+std::string TlsBridge::channelBinding(size_t leg) const {
+  if (terminate_ == nullptr || terminate_->channel_binding == ChannelBinding::None) {
+    return {};
+  }
+  const Leg& l = leg == kClient ? down_ : up_;
+  if (!l.handshake_done) {
+    return {}; // No TLS on this leg (or not for the login): nothing to bind to.
+  }
+  bssl::UniquePtr<X509> peer;
+  X509* cert = nullptr;
+  if (leg == kClient) {
+    cert = SSL_get_certificate(l.ssl.get());
+  } else {
+    peer.reset(SSL_get_peer_certificate(l.ssl.get()));
+    cert = peer.get();
+  }
+  if (cert == nullptr) {
+    return {};
+  }
+  return "tls-server-end-point:" + tlsServerEndPoint(cert);
 }
 
 std::optional<BridgeError> TlsBridge::forward(Direction d, std::string_view bytes) {

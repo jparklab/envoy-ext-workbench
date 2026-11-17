@@ -226,7 +226,8 @@ std::string buildPreloginResponse(const PreloginOptions& client, PreloginEncrypt
   return head + data;
 }
 
-std::string makeTdsMessage(uint8_t type, std::string_view payload, size_t max_packet) {
+std::string makeTdsMessage(uint8_t type, std::string_view payload, size_t max_packet,
+                           uint16_t spid) {
   const size_t chunk = max_packet - kTdsHeaderSize;
   std::string out;
   uint8_t packet_id = 1;
@@ -240,8 +241,8 @@ std::string makeTdsMessage(uint8_t type, std::string_view payload, size_t max_pa
         static_cast<char>(last ? kTdsStatusEom : 0),
         static_cast<char>(len >> 8),
         static_cast<char>(len & 0xff),
-        0, // SPID
-        0,
+        static_cast<char>(spid >> 8),
+        static_cast<char>(spid & 0xff),
         static_cast<char>(packet_id++),
         0, // Window
     };
@@ -309,6 +310,7 @@ std::optional<LoginResponseScan> scanLoginResponse(std::string_view payload, std
     return true;
   };
   while (pos < payload.size()) {
+    const size_t token_start = pos;
     const uint8_t token = static_cast<uint8_t>(payload[pos++]);
     switch (token) {
     case kSspi:
@@ -332,6 +334,7 @@ std::optional<LoginResponseScan> scanLoginResponse(std::string_view payload, std
         if (!scan.sspi) {
           scan.sspi = std::string(data);
         }
+        scan.sspi_tokens.emplace_back(token_start, pos - token_start);
       } else if (token == kError) {
         if (data.size() < 4) {
           error = "ERROR token truncated";
@@ -401,6 +404,32 @@ std::optional<LoginResponseScan> scanLoginResponse(std::string_view payload, std
   }
   scan.fully_scanned = true;
   return scan;
+}
+
+std::string sspiToken(std::string_view data) {
+  std::string out{static_cast<char>(0xed), static_cast<char>(data.size() & 0xff),
+                  static_cast<char>((data.size() >> 8) & 0xff)};
+  return out + std::string(data);
+}
+
+std::string replaceSspiTokens(std::string_view payload, const LoginResponseScan& scan,
+                              std::string_view replacement) {
+  const std::string token = replacement.empty() ? std::string() : sspiToken(replacement);
+  if (scan.sspi_tokens.empty()) {
+    return token + std::string(payload);
+  }
+  std::string out;
+  size_t pos = 0;
+  for (size_t i = 0; i < scan.sspi_tokens.size(); ++i) {
+    const auto [offset, size] = scan.sspi_tokens[i];
+    out += payload.substr(pos, offset - pos);
+    if (i == 0) {
+      out += token;
+    }
+    pos = offset + size;
+  }
+  out += payload.substr(pos);
+  return out;
 }
 
 std::string utf8ToUtf16le(std::string_view s) {

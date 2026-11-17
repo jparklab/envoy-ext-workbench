@@ -29,10 +29,14 @@
 # (filter_config auth.deny) and check that the client gets error 18456 from
 # the module without the server being asked. When the MIT KDC tools are
 # installed, a throwaway realm (modules/mssql_proxy/testdata/mit_kdc.sh) lets
-# those passes also run an ODBC Kerberos login: the module reads the client
-# principal from the ticket with the service keytab (auth.kerberos
-# read_ticket). The SQL Server container has no Kerberos set up, so it refuses
-# the login; what is checked is the principal the module read.
+# those passes also run an ODBC Kerberos login. In the terminating pass the
+# module reads the client principal from the ticket with the service keytab
+# (auth.kerberos read_ticket). In the routing pass it terminates Kerberos
+# (auth.kerberos terminate): the client logs in to the proxy's own SPN, and
+# the module authenticates it, then logs in to the server as its service
+# account. The SQL Server container has no Kerberos set up, so it refuses the
+# login; what is checked is the principal the module learned, the ticket it
+# asked the KDC for, and that the server's refusal reached the client.
 #
 # Set MSSQL_TAP_DIR=<dir> to also record each module-chain connection of the
 # observe pass with Envoy's tap transport socket, as <dir>/<mode>.json (see
@@ -117,12 +121,12 @@ write_config() {
   [[ "$pass" == observe ]] && tap="$TAP_TMP"
   [[ "$pass" != observe ]] && tls="$TMP"
   [[ "$pass" == route ]] && src="$REPO_ROOT/configs/mssql_proxy_routing.yaml"
-  local keytab=""
-  [[ -n "$tls" && -n "$KERBEROS" ]] && keytab="$TMP/kdc/service.keytab"
-  python3 -I - "$src" "$TMP/envoy.yaml" "$port" "$tap" "$tls" "$keytab" <<'EOF' \
+  local kdc=""
+  [[ -n "$tls" && -n "$KERBEROS" ]] && kdc="$TMP/kdc"
+  python3 -I - "$src" "$TMP/envoy.yaml" "$port" "$tap" "$tls" "$kdc" "$pass" <<'EOF' \
     || fail "could not write the Envoy config"
 import sys, yaml
-src, dst, port, tap_dir, tls_dir, keytab = sys.argv[1:]
+src, dst, port, tap_dir, tls_dir, kdc, pass_name = sys.argv[1:]
 cfg = yaml.safe_load(open(src))
 res = cfg["static_resources"]
 for cluster in res["clusters"]:
@@ -141,8 +145,17 @@ if tls_dir:
         "upstream_server_name": "127.0.0.1",
     }
     fc["value"]["auth"] = {"deny": ["denied_login"]}
-    if keytab:
-        fc["value"]["auth"]["kerberos"] = {"mode": "read_ticket", "keytab_file": keytab}
+    if kdc and pass_name == "route":
+        fc["value"]["auth"]["kerberos"] = {
+            "mode": "terminate",
+            "keytab_file": kdc + "/proxy.keytab",
+            "upstream": {"identity": "service_account",
+                         "keytab_file": kdc + "/svc-proxy.keytab",
+                         "spn": "MSSQLSvc/sql.test:1433"},
+        }
+    elif kdc:
+        fc["value"]["auth"]["kerberos"] = {"mode": "read_ticket",
+                                           "keytab_file": kdc + "/service.keytab"}
     for f in chain["filters"]:
         for log in f["typed_config"].get("access_log", []):
             log["typed_config"]["path"] = tls_dir + "/access.log"
@@ -172,7 +185,9 @@ EOF
 
 start_envoy() {
   write_config "$1"
-  "$REPO_ROOT/scripts/run.sh" "$TMP/envoy.yaml" --log-path "$TMP/envoy.log" \
+  # The throwaway realm for the module's Kerberos, and its replay cache.
+  KRB5_CONFIG="$TMP/kdc/krb5.conf" KRB5RCACHEDIR="$TMP" \
+    "$REPO_ROOT/scripts/run.sh" "$TMP/envoy.yaml" --log-path "$TMP/envoy.log" \
     --component-log-level "dynamic_modules:${MSSQL_MODULE_LOG_LEVEL:-info}" &
   envoy_pid=$!
   for _ in $(seq 50); do
@@ -255,19 +270,33 @@ run_denied() {
   echo "  ok: $pass: login refused by name"
 }
 
-# An ODBC Kerberos login (alice@TEST.REALM, ticket for MSSQLSvc/sql.test:1433).
-# The server can't verify it and refuses; the module must have read the
-# principal from the ticket and seen the refusal.
+# An ODBC Kerberos login as alice@TEST.REALM. read_ticket (terminate pass):
+# her ticket is for the server's SPN, and the module reads it on the way.
+# terminate (route pass): her ticket is for the proxy's SPN; the module
+# accepts it and logs in to the server as svc-proxy with a ticket for the
+# server's SPN. Either way the server can't verify Kerberos and refuses; the
+# module must have learned the principal and passed the refusal on.
 run_kerberos() {
-  local out
-  out="$(KRB5_CONFIG="$TMP/kdc/krb5.conf" KRB5CCNAME="FILE:$TMP/kdc/alice.ccache" isql -b -k \
-    "Driver={ODBC Driver 17 for SQL Server};Server=tcp:127.0.0.1,11433;Trusted_Connection=yes;ServerSPN=MSSQLSvc/sql.test:1433;Encrypt=no" \
+  local out spn=MSSQLSvc/sql.test:1433
+  [[ "$pass" == route ]] && spn=MSSQLSvc/proxy.test:1433
+  out="$(KRB5_CONFIG="$TMP/kdc/krb5.conf" KRB5CCNAME="FILE:$TMP/kdc/alice.ccache" isql -v -b -k \
+    "Driver={ODBC Driver 17 for SQL Server};Server=tcp:127.0.0.1,11433;Trusted_Connection=yes;ServerSPN=$spn;Encrypt=no" \
     </dev/null 2>&1)" && fail "$pass: Kerberos login unexpectedly succeeded: $out"
   [[ "$(module_stat login_kerberos_total)" == 1 ]] \
     || fail "$pass: Kerberos login not recognised (client said: $out)"
   [[ "$(module_stat login_failed_total)" == 1 ]] || fail "$pass: the server's refusal not seen: $out"
   [[ "$(module_stat login_denied_total)" == 1 ]] || fail "$pass: the Kerberos login was refused by the module"
-  echo "  ok: $pass: Kerberos principal read from the ticket"
+  grep -q "Login failed" <<<"$out" || fail "$pass: the client didn't get the server's refusal: $out"
+  if [[ "$pass" == route ]]; then
+    # The proxy authenticated alice, and logged in to the server as itself.
+    grep -q "ISSUE: .* alice@TEST.REALM for MSSQLSvc/proxy.test:1433@TEST.REALM" "$TMP/kdc/kdc.log" \
+      || fail "route: alice got no ticket for the proxy: $(tail -5 "$TMP/kdc/kdc.log")"
+    grep -q "ISSUE: .* svc-proxy@TEST.REALM for MSSQLSvc/sql.test:1433@TEST.REALM" "$TMP/kdc/kdc.log" \
+      || fail "route: the proxy got no ticket for the server: $(tail -5 "$TMP/kdc/kdc.log")"
+    echo "  ok: route: Kerberos terminated, the proxy logged in to the server as itself"
+  else
+    echo "  ok: $pass: Kerberos principal read from the ticket"
+  fi
 }
 
 # A throwaway Kerberos realm, when the MIT KDC tools are installed.

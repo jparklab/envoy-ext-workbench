@@ -17,37 +17,10 @@ std::string_view view(const krb5_data& d) { return {d.data, d.length}; }
 
 std::shared_ptr<const KeytabTicketReader> KeytabTicketReader::create(const std::string& path,
                                                                      std::string& error) {
-  krb5_context ctx = threadKrb5Context(error);
-  if (ctx == nullptr) {
+  if (!checkKeytab(path, error)) {
     return nullptr;
   }
-  const std::string name = "FILE:" + path;
-  krb5_keytab kt = nullptr;
-  if (krb5_error_code code = krb5_kt_resolve(ctx, name.c_str(), &kt)) {
-    error = std::format("keytab {}: {}", path, krb5Message(ctx, code));
-    return nullptr;
-  }
-  krb5_kt_cursor cursor;
-  size_t keys = 0;
-  krb5_error_code code = krb5_kt_start_seq_get(ctx, kt, &cursor);
-  if (code == 0) {
-    krb5_keytab_entry entry;
-    while (krb5_kt_next_entry(ctx, kt, &entry, &cursor) == 0) {
-      ++keys;
-      krb5_free_keytab_entry_contents(ctx, &entry);
-    }
-    krb5_kt_end_seq_get(ctx, kt, &cursor);
-  }
-  krb5_kt_close(ctx, kt);
-  if (code != 0) {
-    error = std::format("keytab {}: {}", path, krb5Message(ctx, code));
-    return nullptr;
-  }
-  if (keys == 0) {
-    error = std::format("keytab {} has no keys", path);
-    return nullptr;
-  }
-  return std::shared_ptr<const KeytabTicketReader>(new KeytabTicketReader(name));
+  return std::shared_ptr<const KeytabTicketReader>(new KeytabTicketReader("FILE:" + path));
 }
 
 std::optional<KerberosTicketInfo> KeytabTicketReader::read(std::string_view ap_req_der,

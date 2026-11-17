@@ -138,4 +138,21 @@ std::optional<int64_t> derInteger(std::string_view contents, std::string& error)
   return value;
 }
 
+std::string derEncode(uint8_t tag, std::string_view contents) {
+  std::string out(1, static_cast<char>(tag));
+  const size_t n = contents.size();
+  if (n < 0x80) {
+    out.push_back(static_cast<char>(n));
+  } else {
+    std::string len;
+    for (size_t v = n; v != 0; v >>= 8) {
+      len.insert(len.begin(), static_cast<char>(v & 0xff));
+    }
+    out.push_back(static_cast<char>(0x80 | len.size()));
+    out += len;
+  }
+  out += contents;
+  return out;
+}
+
 } // namespace MssqlProxy

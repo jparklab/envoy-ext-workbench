@@ -27,6 +27,21 @@
 //     }
 //   }
 //
+// or, for the proxy to authenticate Kerberos logins itself:
+//
+//       "kerberos": {
+//         "mode": "terminate",
+//         "keytab_file": "/etc/mssql_proxy/proxy.keytab",  // The proxy's own SPN's keys.
+//         "channel_binding": "none",        // Or "tls_server_end_point"; default none.
+//         "upstream": {                     // How the proxy logs in to SQL Server.
+//           "identity": "service_account",  // Or "delegate" (as the client).
+//           "keytab_file": "/etc/mssql_proxy/proxy-client.keytab",  // service_account's keys.
+//           "principal": "svc-mssql-proxy@EXAMPLE.COM",  // service_account; optional.
+//           "spn": "MSSQLSvc/sql1.example.com:1433",
+//           "cluster_spns": {"sql_sales": "MSSQLSvc/sql2.example.com:1433"}
+//         }
+//       }
+//
 // With "routing", the module answers PRELOGIN itself and connects to the
 // server only once it has read LOGIN7 (tcp_proxy must use
 // upstream_connect_mode ON_DOWNSTREAM_DATA with delayed route selection).
@@ -46,6 +61,14 @@
 // service ticket with the keytab to learn the client principal (see
 // kerberos.h); a ticket it can't read is refused. Route matches can then use
 // "principal" (e.g. "alice@EXAMPLE.COM"), and deny entries name principals.
+// With "terminate", clients log in to the proxy's own SPN; the proxy accepts
+// them with its keytab (see kerberos_terminate.h), applies the policy to the
+// principal, and logs in to SQL Server with its own Kerberos exchange for
+// "spn" (or the routed cluster's in "cluster_spns"): as its service account
+// (upstream keytab_file required), or as the client ("delegate": the TGT the
+// client forwarded, or else constrained delegation as the proxy's own SPN
+// principal from auth.kerberos.keytab_file). NTLM logins still pass through
+// per "ntlm". "channel_binding" binds both legs to their TLS certificates.
 //
 // Unknown keys are rejected, so a typo can't silently disable a setting.
 
@@ -73,7 +96,15 @@ struct RoutingConfig {
 };
 
 struct KerberosConfig {
-  std::string keytab_path; // read_ticket: the service's keytab.
+  bool terminate = false;  // Mode terminate; else read_ticket.
+  std::string keytab_path; // read_ticket: the service's keytab; terminate: the proxy's.
+  // terminate only:
+  bool delegate = false;          // upstream.identity: delegate, else service_account.
+  std::string client_keytab_path; // upstream.keytab_file (service_account).
+  std::string principal;          // upstream.principal (service_account).
+  std::string spn;                // upstream.spn.
+  std::vector<std::pair<std::string, std::string>> cluster_spns;
+  ChannelBinding channel_binding = ChannelBinding::None;
 };
 
 struct FilterConfig {

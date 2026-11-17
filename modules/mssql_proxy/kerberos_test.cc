@@ -4,14 +4,12 @@
 
 #include "kerberos.h"
 
-#include <csignal>
-#include <cstdlib>
 #include <ctime>
-#include <fstream>
 #include <string>
 
 #include "auth.h"
 #include "gtest/gtest.h"
+#include "kdc_test_util.h"
 #include "krb5_util.h"
 #include "krb5_messages.h"
 #include "test_util.h"
@@ -24,40 +22,8 @@ using namespace test;
 constexpr const char* kService = "MSSQLSvc/sql.test:1433@TEST.REALM";
 constexpr const char* kOtherService = "MSSQLSvc/other.test:1433@TEST.REALM";
 
-class Kerberos : public ::testing::Test {
+class Kerberos : public ThrowawayKdc {
 protected:
-  static void SetUpTestSuite() {
-    const char* tmp = std::getenv("TEST_TMPDIR");
-    const char* srcdir = std::getenv("TEST_SRCDIR");
-    const char* script = std::getenv("MIT_KDC");
-    ASSERT_TRUE(tmp && srcdir && script) << "TEST_TMPDIR, TEST_SRCDIR or MIT_KDC not set";
-    dir_ = std::string(tmp) + "/kdc";
-    const std::string command =
-        std::string("bash ") + srcdir + "/" + script + " " + dir_ + " >" + tmp + "/kdc.out 2>&1";
-    const int status = std::system(command.c_str());
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 77) {
-      skip_ = "MIT KDC tools not installed";
-      return;
-    }
-    ASSERT_EQ(status, 0) << "mit_kdc.sh failed; see " << tmp << "/kdc.out";
-    // Before the first Kerberos context of this process.
-    setenv("KRB5_CONFIG", (dir_ + "/krb5.conf").c_str(), 1);
-  }
-
-  static void TearDownTestSuite() {
-    std::ifstream pid_file(dir_ + "/kdc.pid");
-    pid_t pid = 0;
-    if (pid_file >> pid && pid > 0) {
-      kill(pid, SIGTERM);
-    }
-  }
-
-  void SetUp() override {
-    if (!skip_.empty()) {
-      GTEST_SKIP() << skip_;
-    }
-  }
-
   std::shared_ptr<const KeytabTicketReader> reader() {
     std::string error;
     auto r = KeytabTicketReader::create(dir_ + "/service.keytab", error);
@@ -97,13 +63,7 @@ protected:
   }
 
   static int64_t now() { return static_cast<int64_t>(std::time(nullptr)); }
-
-  static std::string skip_;
-  static std::string dir_;
 };
-
-std::string Kerberos::skip_;
-std::string Kerberos::dir_;
 
 TEST_F(Kerberos, ReadsTheClientPrincipal) {
   const std::string req = apReq(kService);

@@ -14,8 +14,12 @@
 //   connects to that cluster.
 // - with "auth", it applies a login policy (auth.h): refused logins get
 //   error 18456 and the connection is closed without reaching the server;
-//   with auth.kerberos it reads Kerberos clients' principals from their
-//   tickets with the service keytab (kerberos.h).
+//   with auth.kerberos read_ticket it reads Kerberos clients' principals from
+//   their tickets with the service keytab (kerberos.h); with terminate it
+//   authenticates Kerberos clients itself and logs in to the server with its
+//   own Kerberos exchange (kerberos_terminate.h). Those GSS steps may block on
+//   the KDC, so they run on a worker pool owned by the filter config, with the
+//   connection's reads paused, and the filter resumes through its scheduler.
 // LOGIN7 fields, the login method, the claimed identity and the login result
 // go into dynamic metadata under "mssql_proxy" (see reportLogin), for access
 // logs. Connections whose framing is malformed or breaks the protocol are
@@ -30,10 +34,12 @@
 
 #include "config.h"
 #include "kerberos.h"
+#include "kerberos_terminate.h"
 #include "source/extensions/dynamic_modules/sdk/cpp/sdk.h"
 #include "source/extensions/dynamic_modules/sdk/cpp/sdk_network.h"
 #include "tds_connection.h"
 #include "tls_bridge.h"
+#include "worker_pool.h"
 
 namespace Envoy {
 namespace DynamicModules {
@@ -52,6 +58,10 @@ using MssqlProxy::ConnectionTracker;
 using MssqlProxy::EncryptionMode;
 using MssqlProxy::TlsBridge;
 using MssqlProxy::TlsContexts;
+using MssqlProxy::WorkerPool;
+
+// Threads per filter config for Kerberos terminate's GSS steps.
+constexpr size_t kKerberosWorkers = 4;
 
 struct Metrics {
   MetricID connections = 0;
@@ -87,6 +97,7 @@ struct Shared {
   std::shared_ptr<const TlsContexts> tls; // Null when TLS isn't terminated.
   std::optional<RoutingConfig> routing;   // Set when routing on LOGIN7.
   std::shared_ptr<const AuthSettings> auth; // Null: no login policy.
+  std::shared_ptr<WorkerPool> workers;      // Kerberos terminate's GSS steps.
 };
 
 constexpr std::string_view kMetadataNamespace = "mssql_proxy";
@@ -166,7 +177,8 @@ private:
       }
     }
     data.drain(data.getSize());
-    if (reportLogin() && shared_.routing && !route(*bridge_->login())) {
+    reportLogin();
+    if (!maybeRoute()) {
       return NetworkFilterStatus::Stop;
     }
     if (shared_.routing && bridge_->parsing() && !bridge_->upstreamStarted()) {
@@ -176,6 +188,7 @@ private:
         handle_.injectWriteData(out.to_client, false);
       }
       reportBridge(was_parsing);
+      startWork();
       return NetworkFilterStatus::Stop;
     }
     if (client) {
@@ -191,7 +204,75 @@ private:
     }
 
     reportBridge(was_parsing);
+    startWork();
     return NetworkFilterStatus::Continue;
+  }
+
+  // Kerberos terminate: runs the bridge's pending GSS step on the worker pool,
+  // with the client's reads paused; the result comes back on this
+  // connection's thread through the scheduler, unless it closed meanwhile.
+  void startWork() {
+    if (!bridge_->waiting()) {
+      return;
+    }
+    std::function<void()> work = bridge_->takeWork();
+    if (!work) {
+      return; // Already running.
+    }
+    if (!shared_.workers) {
+      close(metrics_.protocol_errors, "mssql_proxy_protocol_error", "no Kerberos workers");
+      return;
+    }
+    handle_.readDisable(true);
+    std::shared_ptr<Scheduler> scheduler = handle_.getScheduler();
+    shared_.workers->post([work = std::move(work), scheduler, alive = std::weak_ptr<bool>(alive_),
+                           this] {
+      work();
+      scheduler->schedule([alive, this] {
+        if (alive.lock()) {
+          resumeBridge();
+        }
+      });
+    });
+  }
+
+  void resumeBridge() {
+    if (closed_) {
+      return;
+    }
+    handle_.readDisable(false);
+    BridgeOutput out;
+    std::optional<BridgeError> error = bridge_->resume(out);
+    reportLogin();
+    if (error) {
+      if (error->kind == BridgeError::Kind::Denied && !out.to_client.empty()) {
+        handle_.injectWriteData(out.to_client, false); // The refusal.
+      }
+      closeOnError(*error);
+      return;
+    }
+    if (!maybeRoute()) {
+      return;
+    }
+    if (!out.to_server.empty()) {
+      handle_.injectReadData(out.to_server, false);
+    }
+    if (!out.to_client.empty()) {
+      handle_.injectWriteData(out.to_client, false);
+    }
+    reportBridge(bridge_->parsing());
+    startWork();
+  }
+
+  // With routing, picks the cluster once the bridge is about to open the
+  // server's leg (the login's identity is then final). False when the
+  // connection was closed.
+  bool maybeRoute() {
+    if (!shared_.routing || routed_ || !bridge_->upstreamStarted() || !bridge_->login()) {
+      return true;
+    }
+    routed_ = true;
+    return route(*bridge_->login());
   }
 
   void reportBridge(bool was_parsing) {
@@ -214,6 +295,9 @@ private:
     if (match == nullptr) {
       handle_.incrementCounterValue(metrics_.unrouted, 1);
       return true;
+    }
+    if (shared_.auth && shared_.auth->terminate) {
+      bridge_->setUpstreamSpn(shared_.auth->terminate->spnFor(match->cluster));
     }
     if (!handle_.setFilterStateTyped("envoy.tcp_proxy.cluster", match->cluster)) {
       close(metrics_.protocol_errors, "mssql_proxy_route_error",
@@ -376,7 +460,10 @@ private:
   std::optional<LoginMethod> method_reported_;
   std::string identity_reported_;
   bool result_reported_ = false;
+  bool routed_ = false;
   bool closed_ = false;
+  // Expires with the filter: a GSS step finishing later finds it gone.
+  std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);
 };
 
 class MssqlProxyFilterFactory : public NetworkFilterFactory {
@@ -438,10 +525,28 @@ public:
     metrics.method_integrated = counter("mssql_proxy_login_integrated_total");
     metrics.method_federated = counter("mssql_proxy_login_federated_total");
     std::shared_ptr<const AuthSettings> auth;
+    std::shared_ptr<WorkerPool> workers;
     if (config->auth) {
-      if (config->kerberos) {
-        config->auth->kerberos =
-            MssqlProxy::KeytabTicketReader::create(config->kerberos->keytab_path, error);
+      if (const auto& k = config->kerberos; k && k->terminate) {
+        auto terminator = MssqlProxy::GssTerminator::create(
+            {.keytab_path = k->keytab_path,
+             .delegate = k->delegate,
+             .client_keytab_path = k->client_keytab_path,
+             .principal = k->principal},
+            error);
+        if (!terminator) {
+          DYM_LOG(handle, LogLevel::Error, "mssql_proxy: invalid Kerberos settings: {}", error);
+          return nullptr;
+        }
+        config->auth->terminate = MssqlProxy::KerberosTerminate{
+            .terminator = std::move(terminator),
+            .spn = k->spn,
+            .cluster_spns = k->cluster_spns,
+            .channel_binding = k->channel_binding,
+        };
+        workers = std::make_shared<WorkerPool>(kKerberosWorkers);
+      } else if (k) {
+        config->auth->kerberos = MssqlProxy::KeytabTicketReader::create(k->keytab_path, error);
         if (!config->auth->kerberos) {
           DYM_LOG(handle, LogLevel::Error, "mssql_proxy: invalid Kerberos settings: {}", error);
           return nullptr;
@@ -449,8 +554,8 @@ public:
       }
       auth = std::make_shared<const AuthSettings>(std::move(*config->auth));
     }
-    return std::make_unique<MssqlProxyFilterFactory>(
-        Shared{metrics, std::move(tls), std::move(config->routing), std::move(auth)});
+    return std::make_unique<MssqlProxyFilterFactory>(Shared{
+        metrics, std::move(tls), std::move(config->routing), std::move(auth), std::move(workers)});
   }
 };
 

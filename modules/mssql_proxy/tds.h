@@ -14,6 +14,8 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace MssqlProxy {
 
@@ -128,8 +130,10 @@ std::string buildPreloginResponse(const PreloginOptions& client, PreloginEncrypt
                                   std::string_view version);
 
 // Builds a TDS message from a payload: packets of at most max_packet bytes
-// (header included), SPID 0, packet IDs from 1, EOM on the last packet.
-std::string makeTdsMessage(uint8_t type, std::string_view payload, size_t max_packet);
+// (header included), packet IDs from 1, EOM on the last packet. spid: the
+// header's SPID (big-endian on the wire), which servers set and clients 0.
+std::string makeTdsMessage(uint8_t type, std::string_view payload, size_t max_packet,
+                           uint16_t spid = 0);
 
 // Smallest and largest packet size a login can negotiate (MS-TDS 2.2.6.4).
 inline constexpr uint32_t kTdsMinPacketSize = 512;
@@ -140,8 +144,20 @@ struct LoginResponseScan {
   std::optional<uint32_t> packet_size; // From ENVCHANGE type 4 (packet size).
   std::optional<uint32_t> error;       // Number of the first ERROR token, e.g. 18456.
   std::optional<std::string> sspi;     // SSPI token data: the server's next auth token.
-  bool fully_scanned = false;          // False when an unknown token stopped the scan.
+  // Every SSPI token's place in the payload: (offset, size), token type and
+  // length included.
+  std::vector<std::pair<size_t, size_t>> sspi_tokens;
+  bool fully_scanned = false; // False when an unknown token stopped the scan.
 };
+
+// An SSPI token (0xED, USHORT length, data); data must fit 64 KB.
+std::string sspiToken(std::string_view data);
+
+// The server message payload with its SSPI tokens (as scan found them)
+// replaced by one carrying replacement, or removed when it's empty. With no
+// SSPI token there, a non-empty replacement goes first.
+std::string replaceSspiTokens(std::string_view payload, const LoginResponseScan& scan,
+                              std::string_view replacement);
 
 // An ERROR token (number, state, class, message; ServerName, ProcName empty)
 // followed by DONE with the error bit: what SQL Server sends for a refused

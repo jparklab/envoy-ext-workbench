@@ -140,6 +140,7 @@ bool parseNegTokenInit(std::string_view body, AuthToken& out, std::string& error
     out.mechanism = out.offered.front();
     return true;
   }
+  out.mech_token = mech_token;
   return classifyInner(*mech_token, out, error);
 }
 
@@ -185,6 +186,7 @@ bool parseNegTokenResp(std::string_view body, AuthToken& out, std::string& error
     out.mechanism = supported;
     return true;
   }
+  out.mech_token = response;
   if (!classifyInner(*response, out, error)) {
     return false;
   }
@@ -218,6 +220,7 @@ std::optional<AuthToken> parseAuthToken(std::string_view token, std::string& err
   if (token.starts_with(kNtlmSignature)) {
     out.mechanism = AuthMechanism::Ntlm;
     out.inner = token;
+    out.mech_token = token;
     return out;
   }
   const uint8_t first = static_cast<uint8_t>(token[0]);
@@ -245,6 +248,7 @@ std::optional<AuthToken> parseAuthToken(std::string_view token, std::string& err
       if (!classifyKrb5(inner, out, error)) {
         return std::nullopt;
       }
+      out.mech_token = token;
       return out;
     }
     error = "GSS token of an unknown mechanism";
@@ -267,6 +271,22 @@ std::optional<AuthToken> parseAuthToken(std::string_view token, std::string& err
   }
   error = std::format("unrecognised authentication token (first byte 0x{:02x})", first);
   return std::nullopt;
+}
+
+std::string spnegoKerberosInit(std::string_view krb5_token) {
+  // NegTokenInit ::= SEQUENCE { mechTypes [0] SEQUENCE OF OID, mechToken [2] OCTET STRING }
+  const std::string mech_types =
+      derEncode(kTagContext0, derEncode(kDerSequence, derEncode(kDerOid, kKrb5Oid)));
+  const std::string mech_token = derEncode(kTagContext2, derEncode(kDerOctetString, krb5_token));
+  const std::string init = derEncode(kTagContext0, derEncode(kDerSequence, mech_types + mech_token));
+  return derEncode(kTagApplication0, derEncode(kDerOid, kSpnegoOid) + init);
+}
+
+std::string spnegoResponse(std::string_view mech_token) {
+  // NegTokenResp ::= SEQUENCE { responseToken [2] OCTET STRING }
+  return derEncode(kTagContext1,
+                   derEncode(kDerSequence,
+                             derEncode(kTagContext2, derEncode(kDerOctetString, mech_token))));
 }
 
 } // namespace MssqlProxy

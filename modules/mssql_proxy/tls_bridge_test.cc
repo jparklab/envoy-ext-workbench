@@ -3,15 +3,12 @@
 // tests check that each leg's handshake completes against the bridge and that
 // what one peer sends arrives at the other unchanged in plain text.
 
-#include <openssl/ec_key.h>
-#include <openssl/evp.h>
-#include <openssl/pem.h>
-#include <openssl/x509.h>
-#include <openssl/x509v3.h>
-
+#include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
+#include "bridge_test_util.h"
 #include "gtest/gtest.h"
 #include "tds.h"
 #include "test_util.h"
@@ -21,291 +18,6 @@ namespace MssqlProxy {
 namespace {
 
 using namespace test;
-
-constexpr uint8_t kEncOff = 0x00;
-constexpr uint8_t kEncOn = 0x01;
-constexpr uint8_t kEncNotSup = 0x02;
-constexpr uint8_t kEncReq = 0x03;
-constexpr uint8_t kEncClientCert = 0x80;
-
-// ---------------------------------------------------------------- certificates
-
-struct Cert {
-  std::string cert_pem;
-  std::string key_pem;
-};
-
-// Throwaway self-signed P-256 certificate for "name", also valid for 127.0.0.1.
-// key_usage, when set, is added as the keyUsage extension.
-Cert makeCert(const std::string& name, const char* key_usage = nullptr) {
-  bssl::UniquePtr<EC_KEY> ec(EC_KEY_new_by_curve_name(NID_X9_62_prime256v1));
-  EXPECT_TRUE(EC_KEY_generate_key(ec.get()));
-  bssl::UniquePtr<EVP_PKEY> key(EVP_PKEY_new());
-  EXPECT_TRUE(EVP_PKEY_assign_EC_KEY(key.get(), ec.release()));
-
-  bssl::UniquePtr<X509> x(X509_new());
-  X509_set_version(x.get(), X509_VERSION_3);
-  ASN1_INTEGER_set(X509_get_serialNumber(x.get()), 1);
-  X509_gmtime_adj(X509_getm_notBefore(x.get()), -3600);
-  X509_gmtime_adj(X509_getm_notAfter(x.get()), 86400);
-  X509_set_pubkey(x.get(), key.get());
-  X509_NAME* subject = X509_get_subject_name(x.get());
-  X509_NAME_add_entry_by_txt(subject, "CN", MBSTRING_ASC,
-                             reinterpret_cast<const uint8_t*>(name.c_str()), -1, -1, 0);
-  X509_set_issuer_name(x.get(), subject);
-  const std::string san = "DNS:" + name + ",IP:127.0.0.1";
-  bssl::UniquePtr<X509_EXTENSION> ext(
-      X509V3_EXT_nconf_nid(nullptr, nullptr, NID_subject_alt_name, san.c_str()));
-  EXPECT_TRUE(ext && X509_add_ext(x.get(), ext.get(), -1));
-  if (key_usage != nullptr) {
-    bssl::UniquePtr<X509_EXTENSION> ku(
-        X509V3_EXT_nconf_nid(nullptr, nullptr, NID_key_usage, key_usage));
-    EXPECT_TRUE(ku && X509_add_ext(x.get(), ku.get(), -1));
-  }
-  EXPECT_TRUE(X509_sign(x.get(), key.get(), EVP_sha256()));
-
-  auto toPem = [](auto write) {
-    bssl::UniquePtr<BIO> bio(BIO_new(BIO_s_mem()));
-    write(bio.get());
-    const uint8_t* data;
-    size_t len;
-    BIO_mem_contents(bio.get(), &data, &len);
-    return std::string(reinterpret_cast<const char*>(data), len);
-  };
-  return {toPem([&](BIO* b) { PEM_write_bio_X509(b, x.get()); }),
-          toPem([&](BIO* b) {
-            PEM_write_bio_PrivateKey(b, key.get(), nullptr, nullptr, 0, nullptr, nullptr);
-          })};
-}
-
-const Cert& proxyCert() {
-  static const Cert c = makeCert("proxy.test");
-  return c;
-}
-// Like a typical SQL Server certificate: self-signed, but its key usage
-// doesn't allow signing certificates, so it can only be trusted as itself.
-const Cert& serverCert() {
-  static const Cert c = makeCert("db.test", "critical,digitalSignature,keyEncipherment");
-  return c;
-}
-
-TlsSettings settings(const std::string& server_name = "db.test") {
-  TlsSettings s;
-  s.cert_pem = proxyCert().cert_pem;
-  s.key_pem = proxyCert().key_pem;
-  s.upstream_ca_pem = serverCert().cert_pem;
-  s.upstream_server_name = server_name;
-  return s;
-}
-
-std::shared_ptr<const TlsContexts> contexts(const TlsSettings& s = settings()) {
-  std::string error;
-  auto c = TlsContexts::create(s, error);
-  EXPECT_TRUE(c) << error;
-  return c;
-}
-
-// ---------------------------------------------------------------- peers
-
-// A TDS 7.x client or server: PRELOGIN exchange, TLS handshake carried in
-// PRELOGIN packets, then TDS messages over TLS or plain.
-class Peer : public UnitSink {
-public:
-  Peer(bool server, uint8_t encryption, bool mars)
-      : server_(server), encryption_(encryption), mars_(mars) {
-    ctx_.reset(SSL_CTX_new(server ? TLS_server_method() : TLS_client_method()));
-    if (server) {
-      bssl::UniquePtr<BIO> c(BIO_new_mem_buf(serverCert().cert_pem.data(), -1));
-      bssl::UniquePtr<BIO> k(BIO_new_mem_buf(serverCert().key_pem.data(), -1));
-      bssl::UniquePtr<X509> cert(PEM_read_bio_X509(c.get(), nullptr, nullptr, nullptr));
-      bssl::UniquePtr<EVP_PKEY> key(PEM_read_bio_PrivateKey(k.get(), nullptr, nullptr, nullptr));
-      SSL_CTX_use_certificate(ctx_.get(), cert.get());
-      SSL_CTX_use_PrivateKey(ctx_.get(), key.get());
-    }
-    ssl_.reset(SSL_new(ctx_.get()));
-    rbio_ = BIO_new(BIO_s_mem());
-    wbio_ = BIO_new(BIO_s_mem());
-    SSL_set_bio(ssl_.get(), rbio_, wbio_);
-    if (server) {
-      SSL_set_accept_state(ssl_.get());
-    } else {
-      SSL_set_connect_state(ssl_.get());
-    }
-  }
-
-  // The client opens the connection with its PRELOGIN.
-  void start() {
-    out += makeTdsMessage(kTdsPrelogin, preloginPayload(encryption_, mars_), 4096);
-  }
-
-  void receive(std::string_view data) {
-    if (auto e = splitter_.feed(data, *this)) {
-      failure = *e;
-    }
-  }
-
-  // Sends one TDS message, over TLS when asked.
-  void send(uint8_t type, std::string_view payload, bool over_tls, size_t packet_size = 4096) {
-    sendRaw(makeTdsMessage(type, payload, packet_size), over_tls);
-  }
-  void sendRaw(std::string_view bytes, bool over_tls) {
-    if (!over_tls) {
-      out += bytes;
-      return;
-    }
-    ASSERT_EQ(SSL_write(ssl_.get(), bytes.data(), static_cast<int>(bytes.size())),
-              static_cast<int>(bytes.size()));
-    out += drain();
-  }
-
-  std::optional<std::string> onUnit(const Unit& unit) override {
-    if (!peer_prelogin) {
-      std::string error;
-      peer_prelogin = parsePrelogin(unit.payload(), error);
-      if (!peer_prelogin) {
-        return error;
-      }
-      if (server_) {
-        out += makeTdsMessage(kTdsTabularResult, preloginPayload(encryption_, mars_), 4096);
-      }
-      const bool tls = (encryption_ & 0x7f) != kEncNotSup &&
-                       peer_prelogin->encryption != PreloginEncryption::NotSupported;
-      splitter_.setMarsEnabled(mars_ && peer_prelogin->mars.value_or(false));
-      if (tls && !server_) {
-        handshake();
-      }
-      return std::nullopt;
-    }
-    if (unit.kind == UnitKind::TdsPacket && unit.type == kTdsPrelogin && !handshake_done) {
-      BIO_write(rbio_, unit.payload().data(), static_cast<int>(unit.payload().size()));
-      handshake();
-      return std::nullopt;
-    }
-    if (unit.kind == UnitKind::TlsRecord) {
-      BIO_write(rbio_, unit.bytes.data(), static_cast<int>(unit.bytes.size()));
-      char buf[16384];
-      int n;
-      while ((n = SSL_read(ssl_.get(), buf, sizeof(buf))) > 0) {
-        received.append(buf, n);
-      }
-      return std::nullopt;
-    }
-    received += unit.bytes;
-    return std::nullopt;
-  }
-
-  std::string out;      // Bytes for the bridge.
-  std::string received; // TDS bytes after the PRELOGIN exchange, decrypted if over TLS.
-  std::optional<PreloginOptions> peer_prelogin;
-  bool handshake_done = false;
-  std::optional<std::string> failure;
-
-private:
-  void handshake() {
-    const int r = SSL_do_handshake(ssl_.get());
-    if (std::string flight = drain(); !flight.empty()) {
-      out += makeTdsMessage(kTdsPrelogin, flight, 4096);
-    }
-    if (r == 1) {
-      handshake_done = true;
-    } else if (SSL_get_error(ssl_.get(), r) != SSL_ERROR_WANT_READ) {
-      failure = "peer TLS handshake failed";
-    }
-  }
-  std::string drain() {
-    std::string s(BIO_pending(wbio_), '\0');
-    BIO_read(wbio_, s.data(), static_cast<int>(s.size()));
-    return s;
-  }
-
-  bool server_;
-  uint8_t encryption_;
-  bool mars_;
-  bssl::UniquePtr<SSL_CTX> ctx_;
-  bssl::UniquePtr<SSL> ssl_;
-  BIO* rbio_;
-  BIO* wbio_;
-  StreamSplitter splitter_;
-};
-
-// Client <-> bridge <-> server, moving bytes until nothing is left to move.
-// Each delivery to the bridge is cut into pieces of `chunk` bytes (0: whole).
-struct Harness {
-  Harness(uint8_t client_enc, uint8_t server_enc, size_t chunk, bool mars = false,
-          std::shared_ptr<const TlsContexts> ctx = contexts(), BridgeOptions options = {},
-          std::optional<bool> server_mars = std::nullopt)
-      : client(false, client_enc, mars), server(true, server_enc, server_mars.value_or(mars)),
-        bridge(std::move(ctx), options), chunk(chunk) {}
-
-  // Delivers pending bytes until quiet (the server's only unless held back).
-  // Returns false on a bridge error.
-  bool pump(bool hold_server = false) {
-    for (int round = 0; round < 50 && !error; ++round) {
-      const bool from_client = !client.out.empty();
-      if (from_client) {
-        deliver(true);
-      }
-      const bool from_server = !hold_server && !server.out.empty() && !error;
-      if (from_server) {
-        deliver(false);
-      }
-      if (!from_client && !from_server) {
-        break;
-      }
-    }
-    EXPECT_FALSE(client.failure) << *client.failure;
-    EXPECT_FALSE(server.failure) << *server.failure;
-    return !error;
-  }
-
-  // Delivers everything one peer has sent so far.
-  void deliver(bool from_client) {
-    const std::string data = std::exchange(from_client ? client.out : server.out, "");
-    const size_t step = chunk == 0 ? data.size() : chunk;
-    for (size_t pos = 0; pos < data.size() && !error; pos += step) {
-      BridgeOutput out;
-      const std::string_view piece = std::string_view(data).substr(pos, step);
-      error = from_client ? bridge.onClientData(piece, out) : bridge.onServerData(piece, out);
-      if (error) {
-        if (error->kind == BridgeError::Kind::Denied) {
-          client.receive(out.to_client); // The refusal is meant to be delivered.
-        }
-        return;
-      }
-      to_server_wire += out.to_server;
-      server.receive(out.to_server);
-      client.receive(out.to_client);
-    }
-  }
-
-  // The PRELOGIN exchange and both TLS handshakes.
-  bool connect() {
-    client.start();
-    return pump();
-  }
-
-  std::string message() const { return error ? error->message : ""; }
-
-  Peer client;
-  Peer server;
-  TlsBridge bridge;
-  size_t chunk;
-  std::optional<BridgeError> error;
-  std::string to_server_wire; // Everything the bridge sent the server.
-};
-
-std::string loginResponse(std::string_view packet_size) {
-  return loginAck() + envChangePacketSize(packet_size, "4096") + done();
-}
-
-std::string smpPacket(uint8_t flags, std::string_view data) {
-  std::string p{static_cast<char>(kSmpId), static_cast<char>(flags), 0, 0};
-  const size_t len = kSmpHeaderSize + data.size();
-  p.append({static_cast<char>(len), static_cast<char>(len >> 8), static_cast<char>(len >> 16),
-            static_cast<char>(len >> 24)});
-  p.append(8, '\0');
-  return p + std::string(data);
-}
 
 // ---------------------------------------------------------------- contexts
 
@@ -650,10 +362,6 @@ std::shared_ptr<const AuthSettings> policy(bool ntlm_allowed, std::vector<std::s
   return std::make_shared<const AuthSettings>(AuthSettings{.ntlm_allowed = ntlm_allowed, .deny = std::move(deny)});
 }
 
-std::string sspiToken(std::string_view data) {
-  return std::string(1, static_cast<char>(0xed)) + le16(data.size()) + std::string(data);
-}
-
 TEST(Login, ResultFromServer) {
   Harness h(kEncOff, kEncOff, 0);
   ASSERT_TRUE(h.connect()) << h.message();
@@ -816,6 +524,372 @@ TEST(Login, NtlmRefusedWhenTheClientSwitchesToIt) {
   EXPECT_TRUE(h.server.received.empty()) << "the NTLM message must not reach the server";
   EXPECT_EQ(h.bridge.auth().method(), LoginMethod::Ntlm);
   EXPECT_NE(h.client.received.find(utf16("Login failed")), std::string::npos);
+}
+
+// ---------------------------------------------------------------- Kerberos terminate
+
+// Scripted stand-in for the GSS exchanges: returns the steps given, in order,
+// and records what it was asked.
+struct FakeKerberos : KerberosExchange {
+  Step accept(std::string_view token, std::string_view binding) override {
+    accepted.emplace_back(token);
+    client_bindings.emplace_back(binding);
+    return next(accepts);
+  }
+  std::string clientPrincipal() const override { return principal; }
+  Step initiate(std::string_view token, const std::string& spn,
+                std::string_view binding) override {
+    initiated.emplace_back(token);
+    spns.push_back(spn);
+    server_bindings.emplace_back(binding);
+    return next(initiates);
+  }
+  static Step next(std::vector<Step>& steps) {
+    if (steps.empty()) {
+      return Step{.error = "no step scripted"};
+    }
+    Step s = steps.front();
+    steps.erase(steps.begin());
+    return s;
+  }
+
+  std::vector<Step> accepts;
+  std::vector<Step> initiates;
+  std::string principal = "alice@TEST.REALM";
+  std::vector<std::string> accepted, initiated, spns, client_bindings, server_bindings;
+};
+
+struct FakeTerminator : KerberosTerminator {
+  std::shared_ptr<KerberosExchange> start() const override { return exchange; }
+  std::shared_ptr<FakeKerberos> exchange = std::make_shared<FakeKerberos>();
+};
+
+struct Terminate {
+  std::shared_ptr<FakeTerminator> terminator = std::make_shared<FakeTerminator>();
+  FakeKerberos& gss = *terminator->exchange;
+
+  std::shared_ptr<const AuthSettings> settings(std::vector<std::string> deny = {},
+                                               ChannelBinding binding = ChannelBinding::None) {
+    AuthSettings s{.deny = std::move(deny)};
+    s.terminate = KerberosTerminate{.terminator = terminator,
+                                    .spn = "MSSQLSvc/sql.test:1433",
+                                    .channel_binding = binding};
+    return std::make_shared<const AuthSettings>(std::move(s));
+  }
+};
+
+Login7Fields kerberosLogin() {
+  Login7Fields f;
+  f.user = "";
+  f.integrated = true;
+  f.sspi = spnegoInit({kOidMsKrb5, kOidKrb5}, krb5Token(0x0100, "client-ap-req"));
+  f.feature_ext = std::string("\x0a\x01\x00\x00\x00\x01\xff", 7);
+  return f;
+}
+
+// The client's LOGIN7 as the server must get it: the proxy's token in place.
+std::string upstreamLogin(std::string token) {
+  Login7Fields f = kerberosLogin();
+  f.sspi = std::move(token);
+  return makeTdsMessage(kTdsLogin7, login7Payload(f), 4096);
+}
+
+struct TerminateCase {
+  uint8_t client_enc;
+  uint8_t server_enc;
+  bool local_prelogin;
+  bool login_tls;  // The client sends LOGIN7 over TLS.
+  bool server_tls; // The server answers over TLS (full encryption).
+};
+
+class TerminateModes : public ::testing::TestWithParam<TerminateCase> {};
+
+// The whole exchange: the proxy accepts the client, logs in to the server
+// with its own token, checks the server's answer, and hands the client its
+// own answer with LOGINACK.
+TEST_P(TerminateModes, LogsInWithTheProxysOwnToken) {
+  const TerminateCase c = GetParam();
+  Terminate t;
+  t.gss.accepts = {{.token = "proxy-ap-rep", .complete = true}};
+  t.gss.initiates = {{.token = "proxy-to-server"}, {.complete = true}};
+  Harness h(c.client_enc, c.server_enc, 7, false, contexts(),
+            BridgeOptions{.answer_prelogin = c.local_prelogin, .auth = t.settings()});
+  ASSERT_TRUE(h.connect()) << h.message();
+  const Login7Fields f = kerberosLogin();
+  h.client.send(kTdsLogin7, login7Payload(f), c.login_tls, 512);
+  ASSERT_TRUE(h.pump()) << h.message();
+  ASSERT_EQ(t.gss.accepted, std::vector<std::string>{f.sspi});
+  EXPECT_EQ(h.bridge.auth().identity(), "alice@TEST.REALM");
+  EXPECT_EQ(h.bridge.auth().method(), LoginMethod::Kerberos);
+  EXPECT_EQ(t.gss.spns, std::vector<std::string>{"MSSQLSvc/sql.test:1433"});
+  EXPECT_EQ(h.server.received, upstreamLogin("proxy-to-server"))
+      << "everything but the token as the client sent it";
+  EXPECT_TRUE(h.client.received.empty());
+
+  h.server.send(kTdsTabularResult, sspiToken("server-ap-rep") + loginResponse("4096"),
+                c.server_tls);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(t.gss.initiated.back(), "server-ap-rep");
+  EXPECT_EQ(h.client.received, makeTdsMessage(kTdsTabularResult,
+                                              sspiToken("proxy-ap-rep") + loginResponse("4096"),
+                                              4096));
+  EXPECT_EQ(h.bridge.auth().result(), LoginResult::Succeeded);
+  EXPECT_EQ(h.steps_run, 3u);
+
+  // Then the session carries on as usual.
+  h.server.received.clear();
+  h.client.send(kTdsSqlBatch, "select 1", c.client_enc == kEncOn);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(h.server.received, makeTdsMessage(kTdsSqlBatch, "select 1", 4096));
+}
+
+INSTANTIATE_TEST_SUITE_P(Modes, TerminateModes,
+                         ::testing::Values(TerminateCase{kEncOff, kEncOff, false, true, false},
+                                           TerminateCase{kEncOn, kEncOn, false, true, true},
+                                           TerminateCase{kEncNotSup, kEncOff, false, false, false},
+                                           TerminateCase{kEncOn, kEncOn, true, true, true},
+                                           TerminateCase{kEncNotSup, kEncOff, true, false, false},
+                                           TerminateCase{kEncOff, kEncReq, true, true, true}));
+
+TEST(Terminate, RoundsWithTheClientStayLocal) {
+  Terminate t;
+  t.gss.accepts = {{.token = "acceptor-round"}, {.token = "proxy-final", .complete = true}};
+  t.gss.initiates = {{.token = "proxy-to-server"}, {.complete = true}};
+  Harness h(kEncOn, kEncOn, 0, false, contexts(),
+            BridgeOptions{.answer_prelogin = true, .auth = t.settings()});
+  h.client.start();
+  ASSERT_TRUE(h.pump()) << h.message();
+  h.client.send(kTdsLogin7, login7Payload(kerberosLogin()), true);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(h.client.received,
+            makeTdsMessage(kTdsTabularResult, sspiToken("acceptor-round"), 4096));
+  EXPECT_TRUE(h.to_server_wire.empty()) << "the server isn't contacted before the client is in";
+  EXPECT_FALSE(h.bridge.upstreamStarted());
+
+  h.client.received.clear();
+  h.client.send(kTdsSspi, "client-round", true);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(t.gss.accepted.back(), "client-round");
+  EXPECT_TRUE(h.bridge.upstreamStarted());
+  EXPECT_EQ(h.server.received, upstreamLogin("proxy-to-server"));
+
+  h.server.send(kTdsTabularResult, sspiToken("server-ap-rep") + loginResponse("4096"), true);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(h.client.received, makeTdsMessage(kTdsTabularResult,
+                                              sspiToken("proxy-final") + loginResponse("4096"),
+                                              4096));
+}
+
+TEST(Terminate, RoundsWithTheServerStayLocal) {
+  Terminate t;
+  t.gss.accepts = {{.complete = true}}; // No final token for the client.
+  t.gss.initiates = {{.token = "proxy-1"}, {.token = "proxy-2"}, {.complete = true}};
+  Harness h(kEncOn, kEncOn, 0, false, contexts(), BridgeOptions{.auth = t.settings()});
+  ASSERT_TRUE(h.connect()) << h.message();
+  h.client.send(kTdsLogin7, login7Payload(kerberosLogin()), true);
+  ASSERT_TRUE(h.pump()) << h.message();
+
+  h.server.received.clear();
+  h.server.send(kTdsTabularResult, sspiToken("server-round"), true);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(h.server.received, makeTdsMessage(kTdsSspi, "proxy-2", 4096));
+  EXPECT_TRUE(h.client.received.empty()) << "the server's round is the proxy's business";
+
+  h.server.send(kTdsTabularResult, sspiToken("server-final") + loginResponse("4096"), true);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(t.gss.initiated, (std::vector<std::string>{"", "server-round", "server-final"}));
+  EXPECT_EQ(h.client.received, makeTdsMessage(kTdsTabularResult, loginResponse("4096"), 4096));
+  EXPECT_EQ(h.bridge.auth().result(), LoginResult::Succeeded);
+}
+
+// Expects the login refused: ERROR 18456 to the client, and no LOGIN7 at the
+// server unless sent is set.
+void expectRefused(Harness& h, std::string_view reason, bool sent = false) {
+  ASSERT_TRUE(h.error);
+  EXPECT_EQ(h.error->kind, BridgeError::Kind::Denied) << h.message();
+  EXPECT_NE(h.message().find(reason), std::string::npos) << h.message();
+  EXPECT_EQ(h.bridge.auth().result(), LoginResult::Denied);
+  EXPECT_NE(h.client.received.find(utf16("Login failed for user '")), std::string::npos);
+  if (!sent) {
+    EXPECT_TRUE(h.server.received.empty()) << "no LOGIN7 reaches the server";
+  }
+}
+
+TEST(Terminate, ClientTheProxyCantAcceptIsRefused) {
+  Terminate t;
+  t.gss.accepts = {{.error = "Decrypt integrity check failed"}};
+  Harness h(kEncOn, kEncOn, 0, false, contexts(), BridgeOptions{.auth = t.settings()});
+  ASSERT_TRUE(h.connect()) << h.message();
+  h.client.send(kTdsLogin7, login7Payload(kerberosLogin()), true);
+  h.pump();
+  expectRefused(h, "Decrypt integrity check failed");
+  EXPECT_TRUE(t.gss.initiated.empty());
+}
+
+TEST(Terminate, DenyListAppliesToTheAcceptedPrincipal) {
+  Terminate t;
+  t.gss.accepts = {{.complete = true}};
+  Harness h(kEncOn, kEncOn, 0, false, contexts(),
+            BridgeOptions{.answer_prelogin = true, .auth = t.settings({"ALICE@test.realm"})});
+  h.client.start();
+  ASSERT_TRUE(h.pump()) << h.message();
+  h.client.send(kTdsLogin7, login7Payload(kerberosLogin()), true);
+  h.pump();
+  expectRefused(h, "deny list");
+  EXPECT_TRUE(h.to_server_wire.empty()) << "the server is never contacted";
+  EXPECT_NE(h.client.received.find(utf16("Login failed for user 'alice@TEST.REALM'.")),
+            std::string::npos);
+}
+
+TEST(Terminate, ServerTicketFailureIsRefused) {
+  Terminate t;
+  t.gss.accepts = {{.complete = true}};
+  t.gss.initiates = {{.error = "Server not found in Kerberos database"}};
+  Harness h(kEncOn, kEncOn, 0, false, contexts(), BridgeOptions{.auth = t.settings()});
+  ASSERT_TRUE(h.connect()) << h.message();
+  h.client.send(kTdsLogin7, login7Payload(kerberosLogin()), true);
+  h.pump();
+  expectRefused(h, "Server not found in Kerberos database");
+}
+
+TEST(Terminate, ServerThatDoesntAuthenticateItselfIsRefused) {
+  Terminate t;
+  t.gss.accepts = {{.token = "proxy-ap-rep", .complete = true}};
+  t.gss.initiates = {{.token = "proxy-to-server"}};
+  Harness h(kEncOn, kEncOn, 0, false, contexts(), BridgeOptions{.auth = t.settings()});
+  ASSERT_TRUE(h.connect()) << h.message();
+  h.client.send(kTdsLogin7, login7Payload(kerberosLogin()), true);
+  ASSERT_TRUE(h.pump()) << h.message();
+  h.server.send(kTdsTabularResult, loginResponse("4096"), true); // LOGINACK, no AP-REP.
+  h.pump();
+  expectRefused(h, "without authenticating itself", /*sent=*/true);
+  EXPECT_EQ(h.client.received.find(loginAck()), std::string::npos) << "LOGINACK held back";
+}
+
+TEST(Terminate, ServerRefusalReachesTheClient) {
+  Terminate t;
+  t.gss.accepts = {{.token = "proxy-ap-rep", .complete = true}};
+  t.gss.initiates = {{.token = "proxy-to-server"}};
+  Harness h(kEncOn, kEncOn, 0, false, contexts(), BridgeOptions{.auth = t.settings()});
+  ASSERT_TRUE(h.connect()) << h.message();
+  h.client.send(kTdsLogin7, login7Payload(kerberosLogin()), true);
+  ASSERT_TRUE(h.pump()) << h.message();
+  const std::string refusal = buildLoginError(18456, 1, 14, "Login failed for user ''.");
+  h.server.send(kTdsTabularResult, refusal, true);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(h.client.received, makeTdsMessage(kTdsTabularResult, refusal, 4096));
+  EXPECT_EQ(h.bridge.auth().result(), LoginResult::Failed);
+  EXPECT_EQ(h.bridge.auth().identity(), "alice@TEST.REALM");
+}
+
+TEST(Terminate, NtlmPassesThrough) {
+  Terminate t;
+  Harness h(kEncOn, kEncOn, 0, false, contexts(), BridgeOptions{.auth = t.settings()});
+  ASSERT_TRUE(h.connect()) << h.message();
+  Login7Fields f;
+  f.user = "";
+  f.integrated = true;
+  f.sspi = spnegoInit({kOidNtlm}, ntlmMessage(1));
+  h.client.send(kTdsLogin7, login7Payload(f), true);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(h.server.received, makeTdsMessage(kTdsLogin7, login7Payload(f), 4096));
+  EXPECT_EQ(h.steps_run, 0u);
+}
+
+TEST(Terminate, SqlLoginsPassThrough) {
+  Terminate t;
+  Harness h(kEncOn, kEncOn, 0, false, contexts(), BridgeOptions{.auth = t.settings()});
+  ASSERT_TRUE(h.connect()) << h.message();
+  h.client.send(kTdsLogin7, login7Payload(), true);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(h.server.received, makeTdsMessage(kTdsLogin7, login7Payload(), 4096));
+  EXPECT_EQ(h.steps_run, 0u);
+}
+
+TEST(Terminate, UsesTheSpnItIsGiven) {
+  Terminate t;
+  t.gss.accepts = {{.complete = true}};
+  t.gss.initiates = {{.token = "proxy-to-server"}};
+  Harness h(kEncOn, kEncOn, 0, false, contexts(),
+            BridgeOptions{.answer_prelogin = true, .auth = t.settings()});
+  h.client.start();
+  ASSERT_TRUE(h.pump()) << h.message();
+  h.bridge.setUpstreamSpn("MSSQLSvc/b.test:1433"); // As the filter does when routing.
+  h.client.send(kTdsLogin7, login7Payload(kerberosLogin()), true);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(t.gss.spns, std::vector<std::string>{"MSSQLSvc/b.test:1433"});
+}
+
+std::string endPoint(const std::string& cert_pem) {
+  bssl::UniquePtr<BIO> bio(BIO_new_mem_buf(cert_pem.data(), static_cast<int>(cert_pem.size())));
+  bssl::UniquePtr<X509> cert(PEM_read_bio_X509(bio.get(), nullptr, nullptr, nullptr));
+  uint8_t hash[EVP_MAX_MD_SIZE];
+  unsigned int len = 0;
+  EXPECT_TRUE(X509_digest(cert.get(), EVP_sha256(), hash, &len)); // ECDSA with SHA-256.
+  return "tls-server-end-point:" + std::string(reinterpret_cast<char*>(hash), len);
+}
+
+TEST(Terminate, ChannelBindingOfEachLegsCertificate) {
+  Terminate t;
+  t.gss.accepts = {{.complete = true}};
+  t.gss.initiates = {{.token = "proxy-to-server"}};
+  Harness h(kEncOn, kEncOn, 0, false, contexts(),
+            BridgeOptions{.auth = t.settings({}, ChannelBinding::TlsServerEndPoint)});
+  ASSERT_TRUE(h.connect()) << h.message();
+  h.client.send(kTdsLogin7, login7Payload(kerberosLogin()), true);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(t.gss.client_bindings, std::vector<std::string>{endPoint(proxyCert().cert_pem)});
+  EXPECT_EQ(t.gss.server_bindings, std::vector<std::string>{endPoint(serverCert().cert_pem)});
+
+  // No TLS on a leg: nothing to bind to.
+  Terminate plain;
+  plain.gss.accepts = {{.complete = true}};
+  plain.gss.initiates = {{.token = "proxy-to-server"}};
+  Harness p(kEncNotSup, kEncOff, 0, false, contexts(),
+            BridgeOptions{.auth = plain.settings({}, ChannelBinding::TlsServerEndPoint)});
+  ASSERT_TRUE(p.connect()) << p.message();
+  p.client.send(kTdsLogin7, login7Payload(kerberosLogin()), false);
+  ASSERT_TRUE(p.pump()) << p.message();
+  EXPECT_EQ(plain.gss.client_bindings, std::vector<std::string>{""});
+  EXPECT_EQ(plain.gss.server_bindings, std::vector<std::string>{""});
+
+  // Off by default.
+  Terminate none;
+  none.gss.accepts = {{.complete = true}};
+  none.gss.initiates = {{.token = "proxy-to-server"}};
+  Harness n(kEncOn, kEncOn, 0, false, contexts(), BridgeOptions{.auth = none.settings()});
+  ASSERT_TRUE(n.connect()) << n.message();
+  n.client.send(kTdsLogin7, login7Payload(kerberosLogin()), true);
+  ASSERT_TRUE(n.pump()) << n.message();
+  EXPECT_EQ(none.gss.client_bindings, std::vector<std::string>{""});
+}
+
+TEST(Terminate, HoldsDataWhileAStepRuns) {
+  Terminate t;
+  t.gss.accepts = {{.complete = true}};
+  t.gss.initiates = {{.token = "proxy-to-server"}};
+  Harness h(kEncNotSup, kEncOff, 0, false, contexts(), BridgeOptions{.auth = t.settings()});
+  ASSERT_TRUE(h.connect()) << h.message();
+  h.hold_work = true;
+  h.client.send(kTdsLogin7, login7Payload(kerberosLogin()), false);
+  ASSERT_TRUE(h.pump()) << h.message();
+  ASSERT_TRUE(h.bridge.waiting());
+  // A client that doesn't wait for its answer: held, then refused.
+  h.client.send(kTdsSqlBatch, "select 1", false);
+  ASSERT_TRUE(h.pump()) << "held, not processed yet: " << h.message();
+  h.hold_work = false;
+  h.runWork(); // Accepts, then initiates; only then is the held data read.
+  EXPECT_EQ(h.steps_run, 2u);
+  ASSERT_TRUE(h.error);
+  EXPECT_NE(h.message().find("client data during the proxy's Kerberos login"), std::string::npos)
+      << h.message();
+}
+
+TEST(Terminate, ResumeWithoutAStepFails) {
+  Terminate t;
+  TlsBridge bridge(contexts(), BridgeOptions{.auth = t.settings()});
+  BridgeOutput out;
+  EXPECT_TRUE(bridge.resume(out));
 }
 
 } // namespace

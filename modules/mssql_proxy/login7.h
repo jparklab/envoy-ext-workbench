@@ -36,6 +36,15 @@ inline constexpr size_t kMaxLogin7Size = 128 * 1024;
 // malformed input.
 std::optional<Login7> parseLogin7(std::string_view payload, std::string& error);
 
+// The LOGIN7 payload with its SSPI data replaced by sspi, for logging in to
+// the server with the proxy's own token (Kerberos terminate). Everything else
+// stays as the client sent it: the data after the SSPI data moves, and with it
+// every offset pointing there (the feature extension's too); cbSSPI,
+// cbSSPILong and Length are updated. nullopt and error set when the payload is
+// malformed or sspi doesn't fit.
+std::optional<std::string> replaceLogin7Sspi(std::string_view payload, std::string_view sspi,
+                                             std::string& error);
+
 // UTF-16LE to UTF-8; unpaired surrogates become U+FFFD.
 std::string utf16leToUtf8(std::string_view utf16le);
 

@@ -429,6 +429,88 @@ TEST(Login7, ReadsSspi) {
   EXPECT_FALSE(parseLogin7(bad, error));
 }
 
+// A FEATUREEXT block: one feature (id, DWORD length, data), then 0xFF.
+const std::string kFeatureExt{"\x0a\x01\x00\x00\x00\x01\xff", 7};
+
+TEST(Login7, ReplacesSspi) {
+  std::string error;
+  Login7Fields f;
+  f.user = "";
+  f.integrated = true;
+  f.sspi = "client-token";
+  f.feature_ext = kFeatureExt; // After the SSPI data, so its pointer moves.
+  const std::string original = login7Payload(f);
+
+  // The result is what the client would have sent with the other token.
+  for (std::string token : {std::string("a-longer-token-from-the-proxy"), std::string("p"),
+                            std::string(70000, 'p')}) {
+    auto replaced = replaceLogin7Sspi(original, token, error);
+    ASSERT_TRUE(replaced) << error;
+    Login7Fields want = f;
+    want.sspi = token;
+    want.sspi_long = token.size() >= 0xffff;
+    EXPECT_EQ(*replaced, login7Payload(want)) << token.size();
+    auto login = parseLogin7(*replaced, error);
+    ASSERT_TRUE(login) << error;
+    EXPECT_EQ(login->sspi, token);
+    EXPECT_EQ(login->database, "master");
+  }
+  // From cbSSPILong back to cbSSPI.
+  Login7Fields long_sspi = f;
+  long_sspi.sspi = std::string(70000, 'c');
+  long_sspi.sspi_long = true;
+  auto replaced = replaceLogin7Sspi(login7Payload(long_sspi), "client-token", error);
+  ASSERT_TRUE(replaced) << error;
+  EXPECT_EQ(*replaced, original);
+}
+
+TEST(Login7, RefusesSspiReplacementThatCantFit) {
+  std::string error;
+  Login7Fields f;
+  f.integrated = true;
+  f.sspi = "client-token";
+  f.tds_version = 0x71000001; // TDS 7.1: no cbSSPILong.
+  EXPECT_FALSE(replaceLogin7Sspi(login7Payload(f), std::string(70000, 'p'), error));
+  EXPECT_NE(error.find("7.1"), std::string::npos) << error;
+
+  f.tds_version = 0x74000004;
+  std::string overlapping = login7Payload(f);
+  overlapping[36] = overlapping[78]; // The host name starts inside the SSPI data.
+  overlapping[37] = overlapping[79];
+  overlapping[38] = 1;
+  EXPECT_FALSE(replaceLogin7Sspi(overlapping, "p", error));
+  EXPECT_NE(error.find("overlaps"), std::string::npos) << error;
+  EXPECT_FALSE(replaceLogin7Sspi("short", "p", error));
+}
+
+TEST(LoginResponse, ReplacesSspiTokens) {
+  std::string error;
+  const std::string rest = loginAck() + done();
+  const std::string one = sspiToken("server") + rest;
+  auto scan = scanLoginResponse(one, error);
+  ASSERT_TRUE(scan) << error;
+  ASSERT_EQ(scan->sspi_tokens.size(), 1u);
+  EXPECT_EQ(replaceSspiTokens(one, *scan, "proxy"), sspiToken("proxy") + rest);
+  EXPECT_EQ(replaceSspiTokens(one, *scan, ""), rest);
+
+  const std::string two = loginAck() + sspiToken("a") + sspiToken("b") + done();
+  scan = scanLoginResponse(two, error);
+  ASSERT_TRUE(scan) << error;
+  EXPECT_EQ(scan->sspi_tokens.size(), 2u);
+  EXPECT_EQ(replaceSspiTokens(two, *scan, "proxy"), loginAck() + sspiToken("proxy") + done());
+
+  scan = scanLoginResponse(rest, error);
+  ASSERT_TRUE(scan) << error;
+  EXPECT_EQ(replaceSspiTokens(rest, *scan, "proxy"), sspiToken("proxy") + rest);
+  EXPECT_EQ(replaceSspiTokens(rest, *scan, ""), rest);
+}
+
+TEST(Message, KeepsTheServersSpid) {
+  const std::string message = makeTdsMessage(kTdsTabularResult, "x", 4096, 0x1234);
+  EXPECT_EQ(message.substr(4, 2), std::string("\x12\x34", 2));
+  EXPECT_EQ(makeTdsMessage(kTdsTabularResult, "x", 4096).substr(4, 2), std::string(2, '\0'));
+}
+
 TEST(LoginResponse, SspiAndError) {
   std::string error;
   const std::string sspi = std::string(1, static_cast<char>(0xed)) + le16(3) + "tok";

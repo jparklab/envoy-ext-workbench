@@ -20,11 +20,20 @@ bool equalsIgnoreCase(std::string_view a, std::string_view b) {
 
 constexpr uint16_t kKrb5ApReq = 0x0100; // GSS TOK_ID of an AP-REQ (RFC 4121).
 
-std::string loginFailed(std::string_view user) {
+} // namespace
+
+std::string loginFailedMessage(std::string_view user) {
   return std::format("Login failed for user '{}'.", user);
 }
 
-} // namespace
+const std::string& KerberosTerminate::spnFor(std::string_view cluster) const {
+  for (const auto& [name, cluster_spn] : cluster_spns) {
+    if (name == cluster) {
+      return cluster_spn;
+    }
+  }
+  return spn;
+}
 
 const char* loginMethodName(LoginMethod method) {
   switch (method) {
@@ -70,9 +79,23 @@ std::optional<Denial> LoginAuth::onLogin7(const Login7& login) {
   }
   method_ = LoginMethod::Integrated;
   if (!login.has_sspi) {
+    if (settings_->terminate) {
+      // Fails closed: the proxy is to authenticate every integrated login.
+      return Denial{"integrated login without SSPI data", loginFailedMessage("")};
+    }
     return check();
   }
-  return classify(login.sspi);
+  std::optional<Denial> denial = classify(login.sspi);
+  // NTLM can't be terminated (only the challenger can check the response).
+  terminating_ = !denial && settings_->terminate && method_ != LoginMethod::Ntlm;
+  return denial;
+}
+
+std::optional<Denial> LoginAuth::onKerberosAccepted(const std::string& principal) {
+  method_ = LoginMethod::Kerberos;
+  identity_ = principal;
+  kerberos_principal_ = principal;
+  return check();
 }
 
 std::optional<Denial> LoginAuth::onClientSspi(std::string_view token) {
@@ -97,7 +120,7 @@ std::optional<Denial> LoginAuth::classify(std::string_view token) {
         settings_->kerberos->read(parsed->inner, static_cast<int64_t>(std::time(nullptr)), error);
     if (!ticket) {
       // Fails closed: the proxy was told to know who logs in with Kerberos.
-      return Denial{"Kerberos ticket not accepted: " + error, loginFailed("")};
+      return Denial{"Kerberos ticket not accepted: " + error, loginFailedMessage("")};
     }
     kerberos_principal_ = ticket->client;
     identity_ = ticket->client;
@@ -107,28 +130,31 @@ std::optional<Denial> LoginAuth::classify(std::string_view token) {
     std::optional<NtlmAuthenticate> authenticate = parseNtlmAuthenticate(parsed->inner, error);
     if (!authenticate) {
       // Fails closed: the server might read the message differently.
-      return Denial{error, loginFailed("")};
+      return Denial{error, loginFailedMessage("")};
     }
     identity_ = ntlmIdentity(*authenticate);
     if (authenticate->v1 && !settings_->ntlm_v1_allowed) {
-      return Denial{std::format("NTLMv1 login of {} refused", identity_), loginFailed(identity_)};
+      return Denial{std::format("NTLMv1 login of {} refused", identity_), loginFailedMessage(identity_)};
     }
   }
   return check();
 }
 
 std::optional<Denial> LoginAuth::check() {
-  if (method_ && !settings_->ntlm_allowed &&
-      (*method_ == LoginMethod::Ntlm || *method_ == LoginMethod::Integrated)) {
-    // Fails closed: an unrecognised mechanism could be NTLM.
+  // Fails closed: an unrecognised mechanism could be NTLM, unless the proxy
+  // terminates it (it accepts Kerberos only).
+  const bool maybe_ntlm =
+      method_ && (*method_ == LoginMethod::Ntlm ||
+                  (*method_ == LoginMethod::Integrated && !settings_->terminate));
+  if (!settings_->ntlm_allowed && maybe_ntlm) {
     return Denial{std::format("{} login refused: NTLM is not allowed", loginMethodName(*method_)),
-                  loginFailed(identity_)};
+                  loginFailedMessage(identity_)};
   }
   if (!identity_.empty()) {
     for (const std::string& denied : settings_->deny) {
       if (equalsIgnoreCase(identity_, denied)) {
         return Denial{std::format("login of {} refused by the deny list", identity_),
-                      loginFailed(identity_)};
+                      loginFailedMessage(identity_)};
       }
     }
   }

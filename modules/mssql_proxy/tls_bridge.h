@@ -31,11 +31,24 @@
 // messages are held until complete and checked against its policy before they
 // go on; a refused login is answered with ERROR 18456 and never reaches the
 // server.
+//
+// Kerberos terminate (auth.terminate): the bridge itself authenticates an
+// integrated login. The client's token goes to the proxy's acceptor (rounds
+// with the client answered locally); once the client is accepted and allowed,
+// the server's leg is opened and the client's LOGIN7 goes on carrying the
+// proxy's own token for the server instead of the client's. The server's
+// login messages are held until whole: its SSPI tokens go to the proxy's
+// initiator (rounds answered locally), and the message with LOGINACK reaches
+// the client only once the server has proved itself (mutual authentication),
+// with the proxy's last token for the client in place of the server's. GSS
+// steps may block on the KDC, so the bridge hands them out (takeWork) and
+// waits for resume.
 
 #include <openssl/ssl.h>
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -138,8 +151,33 @@ public:
   // How the client logs in, who it claims to be, and the outcome.
   const LoginAuth& auth() const { return auth_; }
 
+  // Kerberos terminate: a GSS step is pending. Take it with takeWork, run it
+  // on any thread (it may block on the KDC), then call resume on this
+  // bridge's thread. Data fed in the meantime is held and processed by resume.
+  bool waiting() const { return waiting_; }
+  std::function<void()> takeWork() { return std::exchange(work_, nullptr); }
+  // Continues after the step ran; output and errors as for onClientData.
+  std::optional<BridgeError> resume(BridgeOutput& out);
+  // Kerberos terminate: the SPN to log in to the server with, e.g. the routed
+  // cluster's (default: auth.terminate's spn). Set before the server's leg
+  // is ready.
+  void setUpstreamSpn(std::string spn) { upstream_spn_ = std::move(spn); }
+
 private:
   enum class Stage { Prelogin, Handshake, Tls, Plain };
+
+  // Kerberos terminate, in order. Accepting, Initiating and Verifying wait for
+  // a GSS step.
+  enum class Kerberos {
+    Off,         // Not terminating (or not yet).
+    Accepting,   // The client's token is with the acceptor.
+    AwaitClient, // The client owes the acceptor another token.
+    Accepted,    // Waiting for the server's leg.
+    Initiating,  // Making the proxy's token for the server.
+    AwaitServer, // LOGIN7 (or a token) sent; the server's answer is due.
+    Verifying,   // The server's token is with the initiator.
+    Done,        // The server's verdict reached the client.
+  };
 
   // Legs are indexed by the direction of the data they receive.
   static constexpr size_t kClient = 0; // Direction::ClientToServer
@@ -194,6 +232,16 @@ private:
   std::optional<BridgeError> readClientSspi(const Unit& unit);
   BridgeError deny(const Denial& denial);
   std::optional<BridgeError> scanLoginMessage(const Unit& unit);
+  void startAccept(std::string_view token);
+  std::optional<BridgeError> afterAccept(KerberosExchange::Step step);
+  void maybeStartInitiate();
+  void startInitiate(std::string_view token);
+  std::optional<BridgeError> afterInitiate(KerberosExchange::Step step);
+  std::optional<BridgeError> onServerLoginUnit(const Unit& unit);
+  std::optional<BridgeError> finishServerMessage(const std::string& message,
+                                                 const LoginResponseScan& scan);
+  // Channel binding application data for a leg, or empty.
+  std::string channelBinding(size_t leg) const;
   std::optional<BridgeError> forward(Direction d, std::string_view bytes);
   std::string drainTls(Leg& leg);
   void setMars(size_t leg, bool enabled);
@@ -247,6 +295,23 @@ private:
   size_t login_messages_scanned_ = 0;
   std::string login_message_;
   std::optional<uint32_t> packet_size_;
+
+  // Kerberos terminate.
+  const KerberosTerminate* terminate_ = nullptr; // In options_.auth; null when off.
+  Kerberos kerberos_ = Kerberos::Off;
+  std::shared_ptr<KerberosExchange> exchange_;
+  std::shared_ptr<KerberosExchange::Step> step_; // The pending step's result.
+  std::function<void()> work_;                   // The pending step, until taken.
+  bool waiting_ = false;
+  std::array<std::string, 2> held_input_; // Data fed while waiting.
+  std::string login7_payload_;            // The client's LOGIN7, for the server.
+  std::string client_final_token_;        // The proxy's last token, sent with LOGINACK.
+  std::string upstream_spn_;
+  bool upstream_complete_ = false; // The server has authenticated itself.
+  std::string server_message_;     // A server login message being assembled.
+  uint16_t server_spid_ = 0;
+  std::string held_message_; // A server message whose SSPI token is being checked.
+  LoginResponseScan held_scan_;
 };
 
 } // namespace MssqlProxy

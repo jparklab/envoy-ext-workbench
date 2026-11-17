@@ -3,6 +3,8 @@
 # 127.0.0.1 port, everything under <dir>:
 #   krb5.conf, kdc.conf      KRB5_CONFIG / KRB5_KDC_PROFILE for this realm
 #   service.keytab           MSSQLSvc/sql.test:1433 (the SQL Server's key)
+#   proxy.keytab             MSSQLSvc/proxy.test:1433 (the proxy's own SPN)
+#   svc-proxy.keytab         svc-proxy (the proxy's service account)
 #   alice.ccache             alice@TEST.REALM's TGT (forwardable)
 #   kdc.pid                  stop with: kill "$(cat <dir>/kdc.pid)"
 # Also MSSQLSvc/other.test:1433, whose key is in no keytab. Every key is
@@ -55,7 +57,11 @@ kdb5_util create -s -r TEST.REALM -P "$(python3 -I -c 'import secrets; print(sec
 kadmin.local -q "addprinc -randkey MSSQLSvc/sql.test:1433" >/dev/null
 kadmin.local -q "addprinc -randkey MSSQLSvc/other.test:1433" >/dev/null
 kadmin.local -q "addprinc -randkey alice" >/dev/null
+kadmin.local -q "addprinc -randkey MSSQLSvc/proxy.test:1433" >/dev/null
+kadmin.local -q "addprinc -randkey svc-proxy" >/dev/null
 kadmin.local -q "ktadd -k $dir/service.keytab MSSQLSvc/sql.test:1433" >/dev/null
+kadmin.local -q "ktadd -k $dir/proxy.keytab MSSQLSvc/proxy.test:1433" >/dev/null
+kadmin.local -q "ktadd -k $dir/svc-proxy.keytab svc-proxy" >/dev/null
 kadmin.local -q "ktadd -norandkey -k $dir/alice.keytab alice" >/dev/null
 krb5kdc -P "$dir/kdc.pid"
 for _ in $(seq 50); do
