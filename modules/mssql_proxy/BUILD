@@ -23,15 +23,37 @@ cc_library(
     name = "auth",
     srcs = [
         "auth.cc",
+        "der.cc",
         "gss_token.cc",
+        "krb5_messages.cc",
         "ntlm.cc",
     ],
     hdrs = [
         "auth.h",
+        "der.h",
         "gss_token.h",
+        "krb5_messages.h",
         "ntlm.h",
     ],
     deps = [":tds"],
+)
+
+# Kerberos read_ticket with MIT libkrb5, loaded at run time (dlopen).
+cc_library(
+    name = "kerberos",
+    srcs = [
+        "kerberos.cc",
+        "krb5_api.cc",
+    ],
+    hdrs = [
+        "kerberos.h",
+        "krb5_api.h",
+    ],
+    linkopts = ["-ldl"],
+    deps = [
+        ":auth",
+        "//third_party/mit_krb5:headers",
+    ],
 )
 
 # TLS termination on both legs of a TDS 7.x connection; no Envoy dependency.
@@ -63,6 +85,7 @@ envoy_dynamic_module(
     deps = [
         ":auth",
         ":config",
+        ":kerberos",
         ":tds",
         ":tls_bridge",
     ],
@@ -108,6 +131,19 @@ cc_test(
     srcs = ["auth_test.cc"],
     deps = [
         ":auth",
+        ":test_util",
+        "@googletest//:gtest_main",
+    ],
+)
+
+# Against a throwaway MIT KDC (testdata/mit_kdc.sh); skips without one.
+cc_test(
+    name = "kerberos_test",
+    srcs = ["kerberos_test.cc"],
+    data = ["testdata/mit_kdc.sh"],
+    env = {"MIT_KDC": "$(rlocationpath testdata/mit_kdc.sh)"},
+    deps = [
+        ":kerberos",
         ":test_util",
         "@googletest//:gtest_main",
     ],

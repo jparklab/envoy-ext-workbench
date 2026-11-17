@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <ctime>
 #include <format>
 
 #include "ntlm.h"
@@ -16,6 +17,8 @@ bool equalsIgnoreCase(std::string_view a, std::string_view b) {
            std::tolower(static_cast<unsigned char>(y));
   });
 }
+
+constexpr uint16_t kKrb5ApReq = 0x0100; // GSS TOK_ID of an AP-REQ (RFC 4121).
 
 std::string loginFailed(std::string_view user) {
   return std::format("Login failed for user '{}'.", user);
@@ -87,6 +90,17 @@ std::optional<Denial> LoginAuth::classify(std::string_view token) {
   if (parsed && parsed->mechanism != AuthMechanism::Unknown) {
     method_ = parsed->mechanism == AuthMechanism::Kerberos ? LoginMethod::Kerberos
                                                            : LoginMethod::Ntlm;
+  }
+  if (parsed && parsed->mechanism == AuthMechanism::Kerberos && settings_->kerberos &&
+      parsed->krb5_tok_id == kKrb5ApReq && kerberos_principal_.empty()) {
+    std::optional<KerberosTicketInfo> ticket =
+        settings_->kerberos->read(parsed->inner, static_cast<int64_t>(std::time(nullptr)), error);
+    if (!ticket) {
+      // Fails closed: the proxy was told to know who logs in with Kerberos.
+      return Denial{"Kerberos ticket not accepted: " + error, loginFailed("")};
+    }
+    kerberos_principal_ = ticket->client;
+    identity_ = ticket->client;
   }
   if (parsed && parsed->mechanism == AuthMechanism::Ntlm &&
       ntlmMessageType(parsed->inner) == kNtlmAuthenticate) {

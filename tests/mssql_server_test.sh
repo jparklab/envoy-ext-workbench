@@ -27,7 +27,12 @@
 # (configs/mssql_proxy_routing.yaml), checking the cluster each login reached
 # and the access log. The terminating passes also refuse one login by name
 # (filter_config auth.deny) and check that the client gets error 18456 from
-# the module without the server being asked.
+# the module without the server being asked. When the MIT KDC tools are
+# installed, a throwaway realm (modules/mssql_proxy/testdata/mit_kdc.sh) lets
+# those passes also run an ODBC Kerberos login: the module reads the client
+# principal from the ticket with the service keytab (auth.kerberos
+# read_ticket). The SQL Server container has no Kerberos set up, so it refuses
+# the login; what is checked is the principal the module read.
 #
 # Set MSSQL_TAP_DIR=<dir> to also record each module-chain connection of the
 # observe pass with Envoy's tap transport socket, as <dir>/<mode>.json (see
@@ -49,6 +54,7 @@ chmod 755 "$TMP" # the container's mssql user must read the certificate files
 envoy_pid=""
 cleanup() {
   [[ -n "$envoy_pid" ]] && { kill "$envoy_pid" 2>/dev/null || true; wait "$envoy_pid" 2>/dev/null || true; }
+  [[ -f "$TMP/kdc/kdc.pid" ]] && kill "$(cat "$TMP/kdc/kdc.pid")" 2>/dev/null || true
   docker rm -f "$NAME" >/dev/null 2>&1 || true
   rm -rf "$TMP"
 }
@@ -111,10 +117,12 @@ write_config() {
   [[ "$pass" == observe ]] && tap="$TAP_TMP"
   [[ "$pass" != observe ]] && tls="$TMP"
   [[ "$pass" == route ]] && src="$REPO_ROOT/configs/mssql_proxy_routing.yaml"
-  python3 -I - "$src" "$TMP/envoy.yaml" "$port" "$tap" "$tls" <<'EOF' \
+  local keytab=""
+  [[ -n "$tls" && -n "$KERBEROS" ]] && keytab="$TMP/kdc/service.keytab"
+  python3 -I - "$src" "$TMP/envoy.yaml" "$port" "$tap" "$tls" "$keytab" <<'EOF' \
     || fail "could not write the Envoy config"
 import sys, yaml
-src, dst, port, tap_dir, tls_dir = sys.argv[1:]
+src, dst, port, tap_dir, tls_dir, keytab = sys.argv[1:]
 cfg = yaml.safe_load(open(src))
 res = cfg["static_resources"]
 for cluster in res["clusters"]:
@@ -133,6 +141,8 @@ if tls_dir:
         "upstream_server_name": "127.0.0.1",
     }
     fc["value"]["auth"] = {"deny": ["denied_login"]}
+    if keytab:
+        fc["value"]["auth"]["kerberos"] = {"mode": "read_ticket", "keytab_file": keytab}
     for f in chain["filters"]:
         for log in f["typed_config"].get("access_log", []):
             log["typed_config"]["path"] = tls_dir + "/access.log"
@@ -245,6 +255,29 @@ run_denied() {
   echo "  ok: $pass: login refused by name"
 }
 
+# An ODBC Kerberos login (alice@TEST.REALM, ticket for MSSQLSvc/sql.test:1433).
+# The server can't verify it and refuses; the module must have read the
+# principal from the ticket and seen the refusal.
+run_kerberos() {
+  local out
+  out="$(KRB5_CONFIG="$TMP/kdc/krb5.conf" KRB5CCNAME="FILE:$TMP/kdc/alice.ccache" isql -b -k \
+    "Driver={ODBC Driver 17 for SQL Server};Server=tcp:127.0.0.1,11433;Trusted_Connection=yes;ServerSPN=MSSQLSvc/sql.test:1433;Encrypt=no" \
+    </dev/null 2>&1)" && fail "$pass: Kerberos login unexpectedly succeeded: $out"
+  [[ "$(module_stat login_kerberos_total)" == 1 ]] \
+    || fail "$pass: Kerberos login not recognised (client said: $out)"
+  [[ "$(module_stat login_failed_total)" == 1 ]] || fail "$pass: the server's refusal not seen: $out"
+  [[ "$(module_stat login_denied_total)" == 1 ]] || fail "$pass: the Kerberos login was refused by the module"
+  echo "  ok: $pass: Kerberos principal read from the ticket"
+}
+
+# A throwaway Kerberos realm, when the MIT KDC tools are installed.
+KERBEROS=""
+if [[ -x /usr/bin/isql ]] && bash "$REPO_ROOT/modules/mssql_proxy/testdata/mit_kdc.sh" "$TMP/kdc" >"$TMP/kdc.out" 2>&1; then
+  KERBEROS=1
+else
+  echo "  skip: Kerberos (no MIT KDC tools or isql; see mit_kdc.sh)"
+fi
+
 # The client-facing certificate for the terminating pass (throwaway). The
 # clients below either don't verify it (login-only) or trust it (-C).
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=127.0.0.1" \
@@ -315,13 +348,18 @@ for pass in observe terminate route; do
       || fail "route: mssql_backend not used for the rest (and the strict client)"
   fi
   [[ "$pass" != observe ]] && run_denied
+  [[ "$pass" != observe && -n "$KERBEROS" ]] && run_kerberos
   stop_envoy
   if [[ "$pass" == route ]]; then
     # The access log carries the LOGIN7 fields (Envoy flushed it on exit).
-    grep -q "cluster=mssql_tempdb user=sa database=tempdb .*auth=sql result=succeeded" "$TMP/access.log" \
+    grep -q "cluster=mssql_tempdb user=sa database=tempdb .*auth=sql identity=sa result=succeeded" "$TMP/access.log" \
       || fail "route: access log lacks the LOGIN7 fields: $(cat "$TMP/access.log")"
     grep -q "user=denied_login .*result=denied details=mssql_proxy_login_denied" "$TMP/access.log" \
       || fail "route: access log lacks the refused login: $(cat "$TMP/access.log")"
+    if [[ -n "$KERBEROS" ]]; then
+      grep -q "auth=kerberos identity=alice@TEST.REALM result=failed" "$TMP/access.log" \
+        || fail "route: access log lacks the Kerberos principal: $(cat "$TMP/access.log")"
+    fi
     echo "  ok: route: access log has LOGIN7 fields and login results"
   fi
 done

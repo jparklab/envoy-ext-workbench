@@ -7,6 +7,7 @@
 // Identities are claims until the server accepts the login (LOGINACK); the
 // policy only ever denies on them, which a false claim can't exploit.
 
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
@@ -19,6 +20,25 @@
 
 namespace MssqlProxy {
 
+// What a Kerberos service ticket says about the client, once decrypted.
+struct KerberosTicketInfo {
+  std::string client;  // Principal, e.g. "alice@EXAMPLE.COM" (krb5 display form).
+  std::string service; // The ticket's service principal, e.g. "MSSQLSvc/sql:1433@EXAMPLE.COM".
+  int64_t endtime = 0; // Ticket expiry, seconds since the epoch.
+};
+
+// Reads the client's identity from an AP-REQ (kerberos.h implements it with
+// the service keytab). Thread-safe.
+class TicketReader {
+public:
+  virtual ~TicketReader() = default;
+  // ap_req is the Kerberos message after the GSS framing; now is the time to
+  // check the ticket and authenticator against. nullopt and error set when the
+  // AP-REQ can't be read or doesn't hold.
+  virtual std::optional<KerberosTicketInfo> read(std::string_view ap_req, int64_t now,
+                                                 std::string& error) const = 0;
+};
+
 struct AuthSettings {
   // NTLM logins pass through (the server verifies them), or are refused.
   bool ntlm_allowed = true;
@@ -28,6 +48,9 @@ struct AuthSettings {
   // case: SQL login names; for NTLM "DOMAIN\user" with the domain as the client
   // sent it (NetBIOS or DNS name), or the bare user name it sent (e.g. a UPN).
   std::vector<std::string> deny;
+  // Kerberos read_ticket: learn the client principal from the ticket. Null:
+  // Kerberos logins pass through unread.
+  std::shared_ptr<const TicketReader> kerberos;
 };
 
 enum class LoginMethod {
@@ -63,8 +86,11 @@ public:
   void setDenied() { result_ = LoginResult::Denied; }
 
   std::optional<LoginMethod> method() const { return method_; }
-  // Who the client claims to be, once known; empty until then.
+  // Who the client claims to be, once known; empty until then. For
+  // Kerberos read_ticket the KDC-issued principal from the ticket.
   const std::string& identity() const { return identity_; }
+  // The Kerberos principal read from the ticket; empty otherwise.
+  const std::string& kerberosPrincipal() const { return kerberos_principal_; }
   LoginResult result() const { return result_; }
   // The server's error number when it refused the login.
   std::optional<uint32_t> serverError() const { return server_error_; }
@@ -76,6 +102,7 @@ private:
   std::shared_ptr<const AuthSettings> settings_;
   std::optional<LoginMethod> method_;
   std::string identity_;
+  std::string kerberos_principal_;
   LoginResult result_ = LoginResult::Pending;
   std::optional<uint32_t> server_error_;
 };

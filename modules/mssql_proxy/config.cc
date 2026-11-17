@@ -94,8 +94,8 @@ std::optional<TlsSettings> parseTls(const Json& tls, const FileReader& read_file
   return settings;
 }
 
-constexpr std::string_view kMatchKeys[] = {"database", "user",        "server_name",
-                                           "app_name", "client_host", "library"};
+constexpr std::string_view kMatchKeys[] = {"database",    "user",    "server_name", "app_name",
+                                           "client_host", "library", "principal"};
 
 std::optional<RoutingConfig> parseRouting(const Json& routing, std::string& error) {
   if (!routing.is_object()) {
@@ -156,12 +156,47 @@ std::optional<RoutingConfig> parseRouting(const Json& routing, std::string& erro
   return config;
 }
 
+std::optional<KerberosConfig> parseKerberos(const Json& kerberos, const FileReader& read_file,
+                                            std::string& error) {
+  constexpr std::string_view kWhere = "auth.kerberos";
+  if (!kerberos.is_object()) {
+    error = "auth.kerberos must be an object";
+    return std::nullopt;
+  }
+  if (!checkKeys(kerberos, kWhere, {"mode", "keytab_file"}, error)) {
+    return std::nullopt;
+  }
+  std::optional<std::string> mode = getString(kerberos, "mode", kWhere, error);
+  if (!mode) {
+    if (error.empty()) {
+      error = "auth.kerberos.mode is required";
+    }
+    return std::nullopt;
+  }
+  if (*mode != "read_ticket") {
+    error = "auth.kerberos.mode must be \"read_ticket\"";
+    return std::nullopt;
+  }
+  std::optional<std::string> keytab = getString(kerberos, "keytab_file", kWhere, error);
+  if (!keytab) {
+    if (error.empty()) {
+      error = "auth.kerberos.keytab_file is required";
+    }
+    return std::nullopt;
+  }
+  if (!read_file(*keytab, error)) { // Readable now; libkrb5 rereads it on use.
+    error = "auth.kerberos.keytab_file: " + error;
+    return std::nullopt;
+  }
+  return KerberosConfig{*keytab};
+}
+
 std::optional<AuthSettings> parseAuth(const Json& auth, std::string& error) {
   if (!auth.is_object()) {
     error = "auth must be an object";
     return std::nullopt;
   }
-  if (!checkKeys(auth, "auth", {"ntlm", "deny"}, error)) {
+  if (!checkKeys(auth, "auth", {"ntlm", "deny", "kerberos"}, error)) {
     return std::nullopt;
   }
   AuthSettings settings;
@@ -199,7 +234,11 @@ bool equalsIgnoreCase(std::string_view a, std::string_view b) {
   });
 }
 
-const std::string& loginField(const Login7& login, std::string_view key) {
+std::string_view loginField(const Login7& login, std::string_view principal,
+                            std::string_view key) {
+  if (key == "principal") {
+    return principal;
+  }
   if (key == "database") {
     return login.database;
   }
@@ -220,10 +259,11 @@ const std::string& loginField(const Login7& login, std::string_view key) {
 
 } // namespace
 
-const Route* selectRoute(const RoutingConfig& routing, const Login7& login) {
+const Route* selectRoute(const RoutingConfig& routing, const Login7& login,
+                         std::string_view principal) {
   for (const Route& route : routing.routes) {
     const bool matches = std::all_of(route.match.begin(), route.match.end(), [&](const auto& m) {
-      return equalsIgnoreCase(loginField(login, m.first), m.second);
+      return equalsIgnoreCase(loginField(login, principal, m.first), m.second);
     });
     if (matches) {
       return &route;
@@ -289,6 +329,12 @@ std::optional<FilterConfig> parseFilterConfig(std::string_view json, const FileR
     config.auth = parseAuth(*it, error);
     if (!config.auth) {
       return std::nullopt;
+    }
+    if (auto k = it->find("kerberos"); k != it->end()) {
+      config.kerberos = parseKerberos(*k, read_file, error);
+      if (!config.kerberos) {
+        return std::nullopt;
+      }
     }
   }
   return config;

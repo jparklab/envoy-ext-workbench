@@ -13,7 +13,9 @@
 //   tcp_proxy (in ON_DOWNSTREAM_DATA mode with delayed route selection)
 //   connects to that cluster.
 // - with "auth", it applies a login policy (auth.h): refused logins get
-//   error 18456 and the connection is closed without reaching the server.
+//   error 18456 and the connection is closed without reaching the server;
+//   with auth.kerberos it reads Kerberos clients' principals from their
+//   tickets with the service keytab (kerberos.h).
 // LOGIN7 fields, the login method, the claimed identity and the login result
 // go into dynamic metadata under "mssql_proxy" (see reportLogin), for access
 // logs. Connections whose framing is malformed or breaks the protocol are
@@ -27,6 +29,7 @@
 #include <utility>
 
 #include "config.h"
+#include "kerberos.h"
 #include "source/extensions/dynamic_modules/sdk/cpp/sdk.h"
 #include "source/extensions/dynamic_modules/sdk/cpp/sdk_network.h"
 #include "tds_connection.h"
@@ -206,7 +209,8 @@ private:
   // Points tcp_proxy at the first matching route's cluster. False (connection
   // closed) when the filter state can't be set.
   bool route(const Login7& login) {
-    const MssqlProxy::Route* match = MssqlProxy::selectRoute(*shared_.routing, login);
+    const MssqlProxy::Route* match =
+        MssqlProxy::selectRoute(*shared_.routing, login, bridge_->auth().kerberosPrincipal());
     if (match == nullptr) {
       handle_.incrementCounterValue(metrics_.unrouted, 1);
       return true;
@@ -435,6 +439,14 @@ public:
     metrics.method_federated = counter("mssql_proxy_login_federated_total");
     std::shared_ptr<const AuthSettings> auth;
     if (config->auth) {
+      if (config->kerberos) {
+        config->auth->kerberos =
+            MssqlProxy::KeytabTicketReader::create(config->kerberos->keytab_path, error);
+        if (!config->auth->kerberos) {
+          DYM_LOG(handle, LogLevel::Error, "mssql_proxy: invalid Kerberos settings: {}", error);
+          return nullptr;
+        }
+      }
       auth = std::make_shared<const AuthSettings>(std::move(*config->auth));
     }
     return std::make_unique<MssqlProxyFilterFactory>(

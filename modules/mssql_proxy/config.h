@@ -19,7 +19,11 @@
 //     },
 //     "auth": {                             // Login policy; needs "tls".
 //       "ntlm": "pass_through",             // Or "v2_only", "deny"; default pass_through.
-//       "deny": ["sa", "CORP\\svc_old"]     // Identities refused with error 18456.
+//       "deny": ["sa", "CORP\\svc_old"],    // Identities refused with error 18456.
+//       "kerberos": {                       // Omit to relay Kerberos logins unread.
+//         "mode": "read_ticket",
+//         "keytab_file": "/etc/mssql_proxy/mssql.keytab"  // The SQL Server service's keys.
+//       }
 //     }
 //   }
 //
@@ -28,7 +32,8 @@
 // upstream_connect_mode ON_DOWNSTREAM_DATA with delayed route selection).
 // Route matches compare LOGIN7 fields exactly, ignoring ASCII case; every
 // field given must match, and an empty match matches everything. Keys:
-// database, user, server_name, app_name, client_host, library. A login no
+// database, user, server_name, app_name, client_host, library, principal
+// (the Kerberos client principal, with auth.kerberos). A login no
 // route matches goes to tcp_proxy's own cluster.
 //
 // "auth" applies to every TDS 7.x login the module reads (see auth.h): logins
@@ -37,6 +42,10 @@
 // claimed user from AUTHENTICATE ("DOMAIN\\user" in deny entries). "v2_only"
 // refuses NTLMv1 responses. With "ntlm": "deny", integrated logins whose
 // mechanism isn't recognised are refused too, since they could be NTLM.
+// With "kerberos" "read_ticket", the module decrypts each Kerberos login's
+// service ticket with the keytab to learn the client principal (see
+// kerberos.h); a ticket it can't read is refused. Route matches can then use
+// "principal" (e.g. "alice@EXAMPLE.COM"), and deny entries name principals.
 //
 // Unknown keys are rejected, so a typo can't silently disable a setting.
 
@@ -63,6 +72,10 @@ struct RoutingConfig {
   std::vector<Route> routes;
 };
 
+struct KerberosConfig {
+  std::string keytab_path; // read_ticket: the service's keytab.
+};
+
 struct FilterConfig {
   // Set when TLS is terminated; otherwise the filter only observes.
   std::optional<TlsSettings> tls;
@@ -70,10 +83,14 @@ struct FilterConfig {
   std::optional<RoutingConfig> routing;
   // Set when a login policy is configured.
   std::optional<AuthSettings> auth;
+  // Set with auth.kerberos (the reader is made from it at load time).
+  std::optional<KerberosConfig> kerberos;
 };
 
-// The first route whose match fits the login, or nullptr.
-const Route* selectRoute(const RoutingConfig& routing, const Login7& login);
+// The first route whose match fits the login, or nullptr. principal: the
+// Kerberos client principal, empty when not known.
+const Route* selectRoute(const RoutingConfig& routing, const Login7& login,
+                         std::string_view principal = {});
 
 // Reads a whole file; returns nullopt and sets error on failure.
 using FileReader = std::function<std::optional<std::string>(const std::string& path,

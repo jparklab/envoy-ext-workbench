@@ -153,11 +153,39 @@ TEST(Config, Auth) {
   EXPECT_FALSE(config->auth->ntlm_v1_allowed);
 }
 
+TEST(Config, Kerberos) {
+  const FileReader files_with_keytab =
+      files({{"/c.pem", "CERT"}, {"/k.pem", "KEY"}, {"/ca.pem", "CA"}, {"/svc.keytab", "KT"}});
+  std::string error;
+  auto config = parseFilterConfig(std::format(R"({{{}, "auth": {{"kerberos": {{
+      "mode": "read_ticket", "keytab_file": "/svc.keytab"}}}},
+      "routing": {{"routes": [{{"match": {{"principal": "alice@TEST.REALM"}}, "cluster": "a"}}]}}}})",
+                                              kTls),
+                                  files_with_keytab, error);
+  ASSERT_TRUE(config) << error;
+  ASSERT_TRUE(config->kerberos);
+  EXPECT_EQ(config->kerberos->keytab_path, "/svc.keytab");
+
+  Login7 login;
+  EXPECT_EQ(selectRoute(*config->routing, login, "ALICE@test.realm")->cluster, "a");
+  EXPECT_EQ(selectRoute(*config->routing, login, ""), nullptr) << "no principal: no match";
+}
+
 TEST(Config, RejectsBadAuth) {
   const std::map<std::string, std::string> cases = {
       {R"({"auth": {}})", "auth needs tls"},
       {std::format(R"({{{}, "auth": []}})", kTls), "auth must be an object"},
-      {std::format(R"({{{}, "auth": {{"kerberos": {{}}}}}})", kTls), "unknown key \"kerberos\""},
+      {std::format(R"({{{}, "auth": {{"kerberos": {{}}}}}})", kTls), "mode is required"},
+      {std::format(R"({{{}, "auth": {{"kerberos": {{"mode": "terminate"}}}}}})", kTls),
+       "must be \"read_ticket\""},
+      {std::format(R"({{{}, "auth": {{"kerberos": {{"mode": "read_ticket"}}}}}})", kTls),
+       "keytab_file is required"},
+      {std::format(R"({{{}, "auth": {{"kerberos": {{"mode": "read_ticket",
+          "keytab_file": "/missing"}}}}}})", kTls),
+       "no such file /missing"},
+      {std::format(R"({{{}, "auth": {{"kerberos": {{"mode": "read_ticket", "keytab": "/k"}}}}}})",
+                   kTls),
+       "unknown key \"keytab\""},
       {std::format(R"({{{}, "auth": {{"ntlm": "relay"}}}})", kTls), "pass_through"},
       {std::format(R"({{{}, "auth": {{"deny": "sa"}}}})", kTls), "must be a list"},
       {std::format(R"({{{}, "auth": {{"deny": [""]}}}})", kTls), "non-empty strings"},

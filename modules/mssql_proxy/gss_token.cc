@@ -2,6 +2,8 @@
 
 #include <format>
 
+#include "der.h"
+
 namespace MssqlProxy {
 
 namespace {
@@ -14,9 +16,6 @@ constexpr std::string_view kNtlmOid{"\x2b\x06\x01\x04\x01\x82\x37\x02\x02\x0a", 
 constexpr std::string_view kNtlmSignature{"NTLMSSP\0", 8};
 
 constexpr uint8_t kTagApplication0 = 0x60; // GSS InitialContextToken
-constexpr uint8_t kTagSequence = 0x30;
-constexpr uint8_t kTagOctetString = 0x04;
-constexpr uint8_t kTagOid = 0x06;
 constexpr uint8_t kTagContext0 = 0xa0;
 constexpr uint8_t kTagContext1 = 0xa1;
 constexpr uint8_t kTagContext2 = 0xa2;
@@ -30,63 +29,6 @@ AuthMechanism mechanismOf(std::string_view oid) {
   }
   return AuthMechanism::Unknown;
 }
-
-// A reader over DER TLVs. Only single-byte tags occur in these structures.
-class Der {
-public:
-  explicit Der(std::string_view data) : data_(data) {}
-
-  bool empty() const { return pos_ == data_.size(); }
-  std::optional<uint8_t> peekTag() const {
-    return empty() ? std::nullopt : std::optional<uint8_t>(static_cast<uint8_t>(data_[pos_]));
-  }
-  std::string_view rest() const { return data_.substr(pos_); }
-
-  // The contents of the next TLV, which must have this tag.
-  std::optional<std::string_view> read(uint8_t tag, std::string& error) {
-    if (empty() || static_cast<uint8_t>(data_[pos_]) != tag) {
-      error = std::format("expected DER tag 0x{:02x}", tag);
-      return std::nullopt;
-    }
-    size_t pos = pos_ + 1;
-    if (pos >= data_.size()) {
-      error = "DER length missing";
-      return std::nullopt;
-    }
-    size_t len = static_cast<uint8_t>(data_[pos++]);
-    if (len & 0x80) {
-      const size_t n = len & 0x7f;
-      if (n == 0 || n > 4) {
-        error = "unsupported DER length"; // Indefinite (BER) or absurdly long.
-        return std::nullopt;
-      }
-      if (data_.size() - pos < n) {
-        error = "DER length truncated";
-        return std::nullopt;
-      }
-      len = 0;
-      for (size_t i = 0; i < n; ++i) {
-        len = (len << 8) | static_cast<uint8_t>(data_[pos++]);
-      }
-    }
-    if (len > data_.size() - pos) {
-      error = "DER value truncated";
-      return std::nullopt;
-    }
-    pos_ = pos + len;
-    return data_.substr(pos, len);
-  }
-
-  // Skips the next TLV, whatever its tag.
-  bool skip(std::string& error) {
-    auto tag = peekTag();
-    return tag && read(*tag, error).has_value();
-  }
-
-private:
-  std::string_view data_;
-  size_t pos_ = 0;
-};
 
 // The mechanism's message inside a mechToken / responseToken.
 bool classifyInner(std::string_view inner, AuthToken& out, std::string& error);
@@ -105,7 +47,7 @@ bool readGssFraming(std::string_view token, std::string_view& oid, std::string_v
     return false;
   }
   Der fields(*body);
-  auto mech = fields.read(kTagOid, error);
+  auto mech = fields.read(kDerOid, error);
   if (!mech) {
     return false;
   }
@@ -150,7 +92,7 @@ bool classifyInner(std::string_view inner, AuthToken& out, std::string& error) {
 // mechListMIC [3] } (NegTokenInit2 has negHints at [3]; both skipped).
 bool parseNegTokenInit(std::string_view body, AuthToken& out, std::string& error) {
   Der outer(body);
-  auto seq = outer.read(kTagSequence, error);
+  auto seq = outer.read(kDerSequence, error);
   if (!seq) {
     return false;
   }
@@ -164,13 +106,13 @@ bool parseNegTokenInit(std::string_view body, AuthToken& out, std::string& error
         return false;
       }
       Der list_der(*types);
-      auto list = list_der.read(kTagSequence, error);
+      auto list = list_der.read(kDerSequence, error);
       if (!list) {
         return false;
       }
       Der oids(*list);
       while (!oids.empty()) {
-        auto oid = oids.read(kTagOid, error);
+        auto oid = oids.read(kDerOid, error);
         if (!oid) {
           return false;
         }
@@ -182,7 +124,7 @@ bool parseNegTokenInit(std::string_view body, AuthToken& out, std::string& error
         return false;
       }
       Der octets(*wrapped);
-      mech_token = octets.read(kTagOctetString, error);
+      mech_token = octets.read(kDerOctetString, error);
       if (!mech_token) {
         return false;
       }
@@ -205,7 +147,7 @@ bool parseNegTokenInit(std::string_view body, AuthToken& out, std::string& error
 // responseToken [2], mechListMIC [3] }.
 bool parseNegTokenResp(std::string_view body, AuthToken& out, std::string& error) {
   Der outer(body);
-  auto seq = outer.read(kTagSequence, error);
+  auto seq = outer.read(kDerSequence, error);
   if (!seq) {
     return false;
   }
@@ -220,7 +162,7 @@ bool parseNegTokenResp(std::string_view body, AuthToken& out, std::string& error
         return false;
       }
       Der oid_der(*wrapped);
-      auto oid = oid_der.read(kTagOid, error);
+      auto oid = oid_der.read(kDerOid, error);
       if (!oid) {
         return false;
       }
@@ -231,7 +173,7 @@ bool parseNegTokenResp(std::string_view body, AuthToken& out, std::string& error
         return false;
       }
       Der octets(*wrapped);
-      response = octets.read(kTagOctetString, error);
+      response = octets.read(kDerOctetString, error);
       if (!response) {
         return false;
       }

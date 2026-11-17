@@ -21,6 +21,29 @@ if [[ $# -eq 0 ]]; then
 fi
 cmd="$1"
 shift
+
+# MIT Kerberos headers for @workbench//third_party/mit_krb5:headers: symlinks
+# to the host's (libkrb5-dev), only the Kerberos ones, so the hermetic
+# sysroot's libc headers are never shadowed.
+link_krb5_headers() {
+  local dst="$REPO_ROOT/modules/third_party/mit_krb5/include" inc="/usr/include" flag et h
+  if command -v krb5-config >/dev/null; then
+    for flag in $(krb5-config --cflags krb5 gssapi); do
+      [[ "$flag" == -I?* ]] && inc="${flag#-I}"
+      [[ "$flag" == /* ]] && inc="$flag" # After -isystem.
+    done
+  fi
+  [[ -f "$inc/krb5.h" ]] || return 0 # No libkrb5-dev: Kerberos code won't build.
+  mkdir -p "$dst"
+  for h in krb5.h krb5 gssapi.h gssapi profile.h; do
+    [[ -e "$inc/$h" ]] && ln -sfn "$inc/$h" "$dst/$h"
+  done
+  for et in "$inc/et" /usr/include/et; do
+    [[ -d "$et" ]] && { ln -sfn "$et" "$dst/et"; break; }
+  done
+  return 0
+}
+link_krb5_headers
 inject="--inject_repository=workbench=$REPO_ROOT/modules"
 
 cd "$REPO_ROOT/envoy"

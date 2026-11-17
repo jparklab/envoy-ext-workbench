@@ -363,17 +363,36 @@ server, which receives the same AP-REQ. A ticket is only issued by the KDC, so
 the name is good enough to route and deny on before the server answers; LOGINACK
 still decides success.
 
-- [ ] Throwaway MIT realm for tests (`krb5kdc` + `kadmin.local` in a temp dir,
-      installed here): KDC, service and client principals, keytabs, `kinit`
-- [ ] `auth.kerberos` config (`mode`, `keytab_file`); keytab read at load with
-      a key for the service checked
-- [ ] Decrypt ticket and authenticator; principal, realm, ticket times
-- [ ] Routing: `principal` match key (known at LOGIN7)
+- [x] MIT libkrb5 loaded at run time (`dlopen`), compiled against the host's
+      headers (`@workbench//third_party/mit_krb5`, symlinked by
+      `scripts/bazel.sh` from `krb5-config`): the hermetic sysroot's glibc is
+      older than libkrb5's, and the module still loads where Kerberos is absent
+- [x] Throwaway MIT realm for tests (`testdata/mit_kdc.sh`: `krb5kdc` +
+      `kadmin.local` in a temp dir): service and client principals, keytabs,
+      a forwardable TGT
+- [x] `auth.kerberos` config (`mode: read_ticket`, `keytab_file`); the keytab
+      is checked for keys at load and reread on use (rotation)
+- [x] AP-REQ and authenticator parsed from DER in the module; the ticket
+      decrypted with `krb5_server_decrypt_ticket_keytab`, the authenticator
+      with the session key; ticket times and authenticator name and time
+      (5-minute skew) checked; no replay cache touched. A ticket the keytab
+      can't read is refused (fails closed)
+- [x] Routing: `principal` match key (known at LOGIN7); deny entries name
+      principals
 - [ ] Optional: PAC group SIDs for policy
-- [ ] Unit tests with tickets from the throwaway realm: right principal; wrong
-      key, expired ticket, mismatched authenticator rejected
-- [ ] Integration test: a SQL Server that shares the service keytab; the
-      forwarded login succeeds and the proxy logs the right principal
+- [x] Unit tests with tickets from the throwaway realm: right principal, the
+      same AP-REQ read twice (no replay cache), another service's ticket,
+      expired and not-yet-valid tickets, a tampered authenticator, malformed
+      and truncated AP-REQs refused; the policy path from a SPNEGO-wrapped
+      LOGIN7
+- [x] Integration test with a real driver: ODBC 17 (`isql`, `ServerSPN`)
+      logs in with Kerberos through Envoy in the terminating and routing
+      passes; the module reads `alice@TEST.REALM` and the access log shows it
+      with the server's refusal
+- [ ] Integration test where the forwarded login succeeds: SQL Server must
+      accept the realm's tickets. A plain MIT realm has no PAC and SQL Server
+      on Linux maps Windows logins through AD, so this likely needs AD or a
+      Samba AD DC (see open questions)
 
 Deployment: the SPN the client targets (the proxy's host and port) must belong
 to the SQL Server's service account, and the proxy holds that account's keytab.
@@ -458,8 +477,10 @@ Async: the GSS calls may contact the KDC (S4U2Proxy, service tickets) and block.
   acceptor, and `terminate` accepts a ticket the server never sees, so the
   proxy's cache stays on and no `KRB5RCACHENAME=none:` fallback is needed.
 - Unverified for Kerberos (Phase 5): whether SQL Server on Linux logs in with a
-  plain MIT realm (no AD) via `mssql-conf` keytab, else the integration tests
-  need AD or Samba AD; whether the MIT KDC (DB2 backend) can grant constrained
+  plain MIT realm (no AD) via `mssql-conf` keytab; without a keytab it refuses
+  with SSPI error 0x8009030e and "untrusted domain" (seen in the server test),
+  and MIT tickets carry no PAC, so a successful login likely needs AD or Samba
+  AD; whether the MIT KDC (DB2 backend) can grant constrained
   delegation for the `delegate` test, else Samba AD; whether SQL Server checks
   Kerberos channel binding under EPA, and which binding it expects.
 - Unverified from the handoff: MIT krb5 SPNEGO acceptance of Windows tokens; whether
