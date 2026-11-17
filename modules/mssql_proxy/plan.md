@@ -276,9 +276,13 @@ auth:
   deny: [ ... ]                  # identities refused with ERROR 18456
 ```
 
-Library: MIT krb5 / GSS-API (system `libkrb5`, `libgssapi_krb5`; 1.20.1 here),
-linked dynamically into the module. Envoy carries no Kerberos code, so there is
-no clash. The `.so` then needs those libraries on the Envoy host.
+Library: MIT krb5 / GSS-API (1.22.3), built from source with Envoy's toolchain
+(`@workbench//third_party/mit_krb5`, `rules_foreign_cc`) and linked statically
+into the module with its symbols hidden: the host needs no Kerberos library,
+and a system libkrb5 elsewhere in the process can't clash with it. Builtin
+crypto (no OpenSSL next to BoringSSL); plugins compiled in, none loaded from the
+host, so no KCM credential caches or SSSD locator. `scripts/bazel.sh` fetches
+the pinned release and checks its sha256; bumping it is ours to do.
 
 ### 5a: Shared pieces
 
@@ -363,10 +367,10 @@ server, which receives the same AP-REQ. A ticket is only issued by the KDC, so
 the name is good enough to route and deny on before the server answers; LOGINACK
 still decides success.
 
-- [x] MIT libkrb5 loaded at run time (`dlopen`), compiled against the host's
-      headers (`@workbench//third_party/mit_krb5`, symlinked by
-      `scripts/bazel.sh` from `krb5-config`): the hermetic sysroot's glibc is
-      older than libkrb5's, and the module still loads where Kerberos is absent
+- [x] MIT Kerberos linked into the module: first loaded from the host at run
+      time (`dlopen`; the hermetic sysroot's glibc is older than the host
+      libkrb5's), then built from source and linked statically (see Library
+      above), so the module needs no Kerberos on the host
 - [x] Throwaway MIT realm for tests (`testdata/mit_kdc.sh`: `krb5kdc` +
       `kadmin.local` in a temp dir): service and client principals, keytabs,
       a forwardable TGT

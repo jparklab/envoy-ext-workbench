@@ -184,7 +184,7 @@ std::optional<KerberosConfig> parseKerberos(const Json& kerberos, const FileRead
     }
     return std::nullopt;
   }
-  if (!read_file(*keytab, error)) { // Readable now; libkrb5 rereads it on use.
+  if (!read_file(*keytab, error)) { // Readable now; reread on use.
     error = "auth.kerberos.keytab_file: " + error;
     return std::nullopt;
   }

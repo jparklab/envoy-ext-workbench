@@ -22,28 +22,34 @@ fi
 cmd="$1"
 shift
 
-# MIT Kerberos headers for @workbench//third_party/mit_krb5:headers: symlinks
-# to the host's (libkrb5-dev), only the Kerberos ones, so the hermetic
-# sysroot's libc headers are never shadowed.
-link_krb5_headers() {
-  local dst="$REPO_ROOT/modules/third_party/mit_krb5/include" inc="/usr/include" flag et h
-  if command -v krb5-config >/dev/null; then
-    for flag in $(krb5-config --cflags krb5 gssapi); do
-      [[ "$flag" == -I?* ]] && inc="${flag#-I}"
-      [[ "$flag" == /* ]] && inc="$flag" # After -isystem.
-    done
+# MIT Kerberos source for @workbench//third_party/mit_krb5, built from source
+# and linked statically into modules. An injected repository can't declare
+# downloads, so the pinned release is fetched here, checked against its
+# sha256, and unpacked (its src/ directory) into the gitignored
+# modules/third_party/mit_krb5/src. Bump the version and hash together; the
+# release is signed by MIT (https://kerberos.org/dist/), verify before bumping.
+KRB5_VERSION="1.22.3"
+KRB5_SHA256="fe90af8441ad9fa9b064b8e53077cefb782a96f8a68276b031dc54af1789ff0b"
+fetch_krb5_source() {
+  local dst="$REPO_ROOT/modules/third_party/mit_krb5/src"
+  local stamp="$dst/.workbench-release" want="krb5-$KRB5_VERSION $KRB5_SHA256"
+  [[ -f "$stamp" && "$(cat "$stamp")" == "$want" ]] && return 0
+  local dl="$REPO_ROOT/build/downloads" tarball="krb5-$KRB5_VERSION.tar.gz"
+  local minor="${KRB5_VERSION%.*}"
+  mkdir -p "$dl"
+  if ! echo "$KRB5_SHA256  $dl/$tarball" | sha256sum -c --status 2>/dev/null; then
+    echo "Fetching MIT Kerberos $KRB5_VERSION" >&2
+    curl -fsSL -o "$dl/$tarball.part" "https://kerberos.org/dist/krb5/$minor/$tarball"
+    echo "$KRB5_SHA256  $dl/$tarball.part" | sha256sum -c --status ||
+      { echo "$0: $tarball: sha256 mismatch" >&2; rm -f "$dl/$tarball.part"; exit 1; }
+    mv "$dl/$tarball.part" "$dl/$tarball"
   fi
-  [[ -f "$inc/krb5.h" ]] || return 0 # No libkrb5-dev: Kerberos code won't build.
+  rm -rf "$dst"
   mkdir -p "$dst"
-  for h in krb5.h krb5 gssapi.h gssapi profile.h; do
-    [[ -e "$inc/$h" ]] && ln -sfn "$inc/$h" "$dst/$h"
-  done
-  for et in "$inc/et" /usr/include/et; do
-    [[ -d "$et" ]] && { ln -sfn "$et" "$dst/et"; break; }
-  done
-  return 0
+  tar -xzf "$dl/$tarball" -C "$dst" --strip-components=2 "krb5-$KRB5_VERSION/src"
+  echo "$want" >"$stamp"
 }
-link_krb5_headers
+fetch_krb5_source
 inject="--inject_repository=workbench=$REPO_ROOT/modules"
 
 cd "$REPO_ROOT/envoy"

@@ -24,8 +24,8 @@ inline constexpr int64_t kKerberosClockSkew = 300;
 
 class KeytabTicketReader : public TicketReader {
 public:
-  // Loads libkrb5 and checks that the keytab file has keys. nullptr (error
-  // set) otherwise. The keytab is reread on use, so it can be rotated.
+  // Checks that the keytab file has keys; nullptr (error set) otherwise. The
+  // keytab is reread on use, so it can be rotated.
   static std::shared_ptr<const KeytabTicketReader> create(const std::string& keytab_path,
                                                           std::string& error);
 

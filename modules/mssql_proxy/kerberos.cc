@@ -4,35 +4,12 @@
 #include <format>
 #include <memory>
 
-#include "krb5_api.h"
+#include "krb5_util.h"
 #include "krb5_messages.h"
 
 namespace MssqlProxy {
 
 namespace {
-
-// One krb5_context per thread: contexts are not shared between threads.
-krb5_context threadContext(const Krb5Api& api, std::string& error) {
-  struct Holder {
-    const Krb5Api* api = nullptr;
-    krb5_context context = nullptr;
-    ~Holder() {
-      if (context != nullptr) {
-        api->krb5_free_context(context);
-      }
-    }
-  };
-  thread_local Holder holder;
-  if (holder.context == nullptr) {
-    if (krb5_error_code code = api.krb5_init_context(&holder.context)) {
-      error = std::format("cannot create a Kerberos context (error {})", code);
-      holder.context = nullptr;
-      return nullptr;
-    }
-    holder.api = &api;
-  }
-  return holder.context;
-}
 
 std::string_view view(const krb5_data& d) { return {d.data, d.length}; }
 
@@ -40,34 +17,30 @@ std::string_view view(const krb5_data& d) { return {d.data, d.length}; }
 
 std::shared_ptr<const KeytabTicketReader> KeytabTicketReader::create(const std::string& path,
                                                                      std::string& error) {
-  const Krb5Api* api = loadKrb5(error);
-  if (api == nullptr) {
-    return nullptr;
-  }
-  krb5_context ctx = threadContext(*api, error);
+  krb5_context ctx = threadKrb5Context(error);
   if (ctx == nullptr) {
     return nullptr;
   }
   const std::string name = "FILE:" + path;
   krb5_keytab kt = nullptr;
-  if (krb5_error_code code = api->krb5_kt_resolve(ctx, name.c_str(), &kt)) {
-    error = std::format("keytab {}: {}", path, api->message(ctx, code));
+  if (krb5_error_code code = krb5_kt_resolve(ctx, name.c_str(), &kt)) {
+    error = std::format("keytab {}: {}", path, krb5Message(ctx, code));
     return nullptr;
   }
   krb5_kt_cursor cursor;
   size_t keys = 0;
-  krb5_error_code code = api->krb5_kt_start_seq_get(ctx, kt, &cursor);
+  krb5_error_code code = krb5_kt_start_seq_get(ctx, kt, &cursor);
   if (code == 0) {
     krb5_keytab_entry entry;
-    while (api->krb5_kt_next_entry(ctx, kt, &entry, &cursor) == 0) {
+    while (krb5_kt_next_entry(ctx, kt, &entry, &cursor) == 0) {
       ++keys;
-      api->krb5_free_keytab_entry_contents(ctx, &entry);
+      krb5_free_keytab_entry_contents(ctx, &entry);
     }
-    api->krb5_kt_end_seq_get(ctx, kt, &cursor);
+    krb5_kt_end_seq_get(ctx, kt, &cursor);
   }
-  api->krb5_kt_close(ctx, kt);
+  krb5_kt_close(ctx, kt);
   if (code != 0) {
-    error = std::format("keytab {}: {}", path, api->message(ctx, code));
+    error = std::format("keytab {}: {}", path, krb5Message(ctx, code));
     return nullptr;
   }
   if (keys == 0) {
@@ -85,8 +58,7 @@ std::optional<KerberosTicketInfo> KeytabTicketReader::read(std::string_view ap_r
     error = "AP-REQ: " + error;
     return std::nullopt;
   }
-  const Krb5Api* api = loadKrb5(error);
-  krb5_context ctx = api != nullptr ? threadContext(*api, error) : nullptr;
+  krb5_context ctx = threadKrb5Context(error);
   if (ctx == nullptr) {
     return std::nullopt;
   }
@@ -97,22 +69,22 @@ std::optional<KerberosTicketInfo> KeytabTicketReader::read(std::string_view ap_r
   ticket_der.length = static_cast<unsigned int>(ap_req->ticket.size());
   ticket_der.data = const_cast<char*>(ap_req->ticket.data());
   krb5_ticket* raw_ticket = nullptr;
-  if (krb5_error_code code = api->krb5_decode_ticket(&ticket_der, &raw_ticket)) {
-    error = "ticket: " + api->message(ctx, code);
+  if (krb5_error_code code = krb5_decode_ticket(&ticket_der, &raw_ticket)) {
+    error = "ticket: " + krb5Message(ctx, code);
     return std::nullopt;
   }
-  auto free_ticket = [api, ctx](krb5_ticket* t) { api->krb5_free_ticket(ctx, t); };
+  auto free_ticket = [ctx](krb5_ticket* t) { krb5_free_ticket(ctx, t); };
   std::unique_ptr<krb5_ticket, decltype(free_ticket)> ticket(raw_ticket, free_ticket);
 
   krb5_keytab kt = nullptr;
-  if (krb5_error_code code = api->krb5_kt_resolve(ctx, keytab_name_.c_str(), &kt)) {
-    error = "keytab: " + api->message(ctx, code);
+  if (krb5_error_code code = krb5_kt_resolve(ctx, keytab_name_.c_str(), &kt)) {
+    error = "keytab: " + krb5Message(ctx, code);
     return std::nullopt;
   }
-  krb5_error_code code = api->krb5_server_decrypt_ticket_keytab(ctx, kt, ticket.get());
-  api->krb5_kt_close(ctx, kt);
+  krb5_error_code code = krb5_server_decrypt_ticket_keytab(ctx, kt, ticket.get());
+  krb5_kt_close(ctx, kt);
   if (code != 0) {
-    error = std::format("ticket for {}: {}", service, api->message(ctx, code));
+    error = std::format("ticket for {}: {}", service, krb5Message(ctx, code));
     return std::nullopt;
   }
   const krb5_enc_tkt_part& part = *ticket->enc_part2;
@@ -143,9 +115,9 @@ std::optional<KerberosTicketInfo> KeytabTicketReader::read(std::string_view ap_r
   plain.magic = KV5M_DATA;
   plain.length = static_cast<unsigned int>(plain_bytes.size());
   plain.data = plain_bytes.data();
-  if (krb5_error_code c = api->krb5_c_decrypt(ctx, part.session, KRB5_KEYUSAGE_AP_REQ_AUTH,
+  if (krb5_error_code c = krb5_c_decrypt(ctx, part.session, KRB5_KEYUSAGE_AP_REQ_AUTH,
                                               nullptr, &encrypted, &plain)) {
-    error = "authenticator: " + api->message(ctx, c);
+    error = "authenticator: " + krb5Message(ctx, c);
     return std::nullopt;
   }
   std::optional<KrbAuthenticator> authenticator =
@@ -170,12 +142,12 @@ std::optional<KerberosTicketInfo> KeytabTicketReader::read(std::string_view ap_r
   }
 
   char* name = nullptr;
-  if (krb5_error_code c = api->krb5_unparse_name(ctx, part.client, &name)) {
-    error = "client name: " + api->message(ctx, c);
+  if (krb5_error_code c = krb5_unparse_name(ctx, part.client, &name)) {
+    error = "client name: " + krb5Message(ctx, c);
     return std::nullopt;
   }
   KerberosTicketInfo info{name, service, static_cast<int64_t>(part.times.endtime)};
-  api->krb5_free_unparsed_name(ctx, name);
+  krb5_free_unparsed_name(ctx, name);
   return info;
 }
 

@@ -38,21 +38,23 @@ cc_library(
     deps = [":tds"],
 )
 
-# Kerberos read_ticket with MIT libkrb5, loaded at run time (dlopen).
+# Kerberos read_ticket with MIT Kerberos, linked statically.
 cc_library(
     name = "kerberos",
     srcs = [
         "kerberos.cc",
-        "krb5_api.cc",
+        "krb5_util.cc",
     ],
     hdrs = [
         "kerberos.h",
-        "krb5_api.h",
+        "krb5_util.h",
     ],
-    linkopts = ["-ldl"],
+    # Kerberos symbols are hidden, so whatever calls them must be in the same
+    # link unit: never a shared library of its own (as tests would make it).
+    linkstatic = True,
     deps = [
         ":auth",
-        "//third_party/mit_krb5:headers",
+        "//third_party/mit_krb5",
     ],
 )
 

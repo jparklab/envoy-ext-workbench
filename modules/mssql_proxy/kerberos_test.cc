@@ -1,6 +1,6 @@
 // Kerberos read_ticket against a throwaway MIT KDC (testdata/mit_kdc.sh): real
 // tickets and AP-REQs, read with the service keytab. Skipped when the MIT KDC
-// tools or libkrb5 are missing.
+// tools are missing.
 
 #include "kerberos.h"
 
@@ -12,7 +12,7 @@
 
 #include "auth.h"
 #include "gtest/gtest.h"
-#include "krb5_api.h"
+#include "krb5_util.h"
 #include "krb5_messages.h"
 #include "test_util.h"
 
@@ -31,11 +31,6 @@ protected:
     const char* srcdir = std::getenv("TEST_SRCDIR");
     const char* script = std::getenv("MIT_KDC");
     ASSERT_TRUE(tmp && srcdir && script) << "TEST_TMPDIR, TEST_SRCDIR or MIT_KDC not set";
-    std::string error;
-    if (loadKrb5(error) == nullptr) {
-      skip_ = error;
-      return;
-    }
     dir_ = std::string(tmp) + "/kdc";
     const std::string command =
         std::string("bash ") + srcdir + "/" + script + " " + dir_ + " >" + tmp + "/kdc.out 2>&1";
@@ -72,34 +67,32 @@ protected:
 
   // alice's AP-REQ for service, as a client sends it inside GSS framing.
   static std::string apReq(const char* service) {
-    std::string error;
-    const Krb5Api& api = *loadKrb5(error);
     krb5_context ctx = nullptr;
-    EXPECT_EQ(api.krb5_init_context(&ctx), 0);
+    EXPECT_EQ(krb5_init_context(&ctx), 0);
     krb5_ccache cc = nullptr;
-    EXPECT_EQ(api.krb5_cc_resolve(ctx, ("FILE:" + dir_ + "/alice.ccache").c_str(), &cc), 0);
+    EXPECT_EQ(krb5_cc_resolve(ctx, ("FILE:" + dir_ + "/alice.ccache").c_str(), &cc), 0);
     krb5_creds in{};
-    EXPECT_EQ(api.krb5_cc_get_principal(ctx, cc, &in.client), 0);
-    EXPECT_EQ(api.krb5_parse_name(ctx, service, &in.server), 0);
+    EXPECT_EQ(krb5_cc_get_principal(ctx, cc, &in.client), 0);
+    EXPECT_EQ(krb5_parse_name(ctx, service, &in.server), 0);
     krb5_creds* creds = nullptr;
-    krb5_error_code code = api.krb5_get_credentials(ctx, 0, cc, &in, &creds);
-    EXPECT_EQ(code, 0) << api.message(ctx, code);
+    krb5_error_code code = krb5_get_credentials(ctx, 0, cc, &in, &creds);
+    EXPECT_EQ(code, 0) << krb5Message(ctx, code);
     std::string out;
     if (code == 0) {
       krb5_auth_context ac = nullptr;
-      api.krb5_auth_con_init(ctx, &ac);
+      krb5_auth_con_init(ctx, &ac);
       krb5_data req{};
-      code = api.krb5_mk_req_extended(ctx, &ac, AP_OPTS_MUTUAL_REQUIRED, nullptr, creds, &req);
-      EXPECT_EQ(code, 0) << api.message(ctx, code);
+      code = krb5_mk_req_extended(ctx, &ac, AP_OPTS_MUTUAL_REQUIRED, nullptr, creds, &req);
+      EXPECT_EQ(code, 0) << krb5Message(ctx, code);
       out.assign(req.data, req.length);
-      api.krb5_free_data_contents(ctx, &req);
-      api.krb5_auth_con_free(ctx, ac);
-      api.krb5_free_creds(ctx, creds);
+      krb5_free_data_contents(ctx, &req);
+      krb5_auth_con_free(ctx, ac);
+      krb5_free_creds(ctx, creds);
     }
-    api.krb5_free_principal(ctx, in.client);
-    api.krb5_free_principal(ctx, in.server);
-    api.krb5_cc_close(ctx, cc);
-    api.krb5_free_context(ctx);
+    krb5_free_principal(ctx, in.client);
+    krb5_free_principal(ctx, in.server);
+    krb5_cc_close(ctx, cc);
+    krb5_free_context(ctx);
     return out;
   }
 
