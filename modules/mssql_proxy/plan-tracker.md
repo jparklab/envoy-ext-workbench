@@ -25,4 +25,5 @@ Progress log against plan.md.
 
 ## Phase 5: Authentication
 
-- [ ] Next up
+- [x] 2026-11-17: plan revised around three options: Kerberos read_ticket (no shared replay cache), Kerberos terminate with re-authentication (delegate or service account, configurable), NTLM pass-through; split into 5a shared pieces, 5b NTLM, 5c read_ticket, 5d terminate
+- [ ] 5a: shared pieces

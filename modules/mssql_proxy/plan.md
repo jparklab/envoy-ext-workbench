@@ -243,98 +243,167 @@ Not done here, left for later:
 
 ## Phase 5: Authentication
 
-- [ ] Log the claimed identity per login type, as dynamic metadata too (identity,
-      auth type, login result)
-- [ ] Allow/deny policy with TDS 18456 error
-- [ ] Entra token (library 0x01) JWT check against JWKS via `httpCallout`
+Three integrated-login options, chosen per mechanism in `filter_config`:
 
-### Kerberos: read-the-ticket model (preferred)
+1. Kerberos `read_ticket`: decrypt only the client's ticket with the keytab of
+   the service the client targeted, learn the principal, and forward LOGIN7
+   unchanged. The proxy never runs an acceptor, so it records nothing in a
+   replay cache and shares none with the server; the server does the full check.
+2. Kerberos `terminate`: the proxy is the Kerberos acceptor (its own SPN and
+   keytab), answers the client itself, and logs in to SQL Server with a new
+   Kerberos exchange using the proxy's credentials, either delegating (SQL
+   Server sees the end user) or as the proxy's service account.
+3. NTLM `pass_through`: relay the three NTLM messages unchanged and read the
+   user from AUTHENTICATE; the server (via its DC) verifies.
 
-The client name is never readable on the proxy's path: in the AP-REQ (LOGIN7
-SSPI data) it is inside the ticket's encrypted part (service key) and the
-authenticator (session key); LOGIN7's user/password fields are empty for
-integrated auth. So the proxy needs the service keytab just to learn who the
-user is.
+All three need the LOGIN7 and SSPI traffic in plain text, so `auth` needs `tls`
+(Phase 3 termination); they work with or without `routing`.
 
-It only needs to decrypt the ticket, not run a full `gss_accept_sec_context`.
-Decrypting the ticket with the keytab key (MIT krb5 lower-level APIs, e.g.
-`krb5_decrypt_tkt_part`) yields the KDC-asserted client name and the PAC, and
-skips the authenticator check, which is what records into the replay cache. It
-does not prove the sender holds the session key (a stolen ticket decrypts too),
-but the server verifies the authenticator, so, as with NTLM, the name is a claim
-until the server returns LOGINACK and verified after. Kerberos and NTLM then
-share one model: read identity in transit, trust it on the server's verdict.
+Config sketch (final names settle in 5a):
 
-- [ ] Unwrap SPNEGO (ASN.1 DER) to the raw krb5 AP-REQ; bounds-checked
-- [ ] Decrypt the ticket with the keytab key; extract client principal and realm
-- [ ] Optional: extract PAC group SIDs for policy
-- [ ] Deny early on the ticket's client name; trust it only after LOGINACK (shares
-      the server login-response parser with NTLM)
-- [ ] Integration test against a Linux SQL Server container sharing the proxy's
-      keytab: forwarded login succeeds and the proxy logs the right principal
+```yaml
+auth:
+  kerberos:
+    mode: read_ticket            # or terminate; absent: Kerberos relayed unread
+    keytab_file: /etc/mssql_proxy/service.keytab
+    upstream:                    # terminate only
+      identity: delegate         # or service_account
+      principal: svc-mssql-proxy@EXAMPLE.COM
+      keytab_file: /etc/mssql_proxy/proxy-client.keytab
+      spn: MSSQLSvc/sql1.example.com:1433
+      cluster_spns: { mssql_tempdb: MSSQLSvc/sql2.example.com:1433 }
+  ntlm: pass_through             # or deny
+  deny: [ ... ]                  # identities refused with ERROR 18456
+```
 
-Fallback, only if a full accept is ever needed (e.g. to verify possession
-before contacting the server): use `gss_accept_sec_context` and disable the
-proxy's replay cache.
+Library: MIT krb5 / GSS-API (system `libkrb5`, `libgssapi_krb5`; 1.20.1 here),
+linked dynamically into the module. Envoy carries no Kerberos code, so there is
+no clash. The `.so` then needs those libraries on the Envoy host.
 
-- [ ] The module sets `KRB5RCACHENAME=none:` (MIT krb5 >= 1.18;
-      `KRB5RCACHETYPE=none` on older) in config init, before any GSS call,
-      without overriding a value the operator already set
-- [ ] Test: forwarded login succeeds with the replay cache disabled, and fails as
-      a replay with it enabled (confirms whether SQL Server shares MIT's rcache)
+### 5a: Shared pieces
 
-### NTLM: relay model
+- [ ] `auth` config: parse and validate, `auth needs tls`, keytabs readable at
+      load (a key for the configured SPN present)
+- [ ] Bridge: carry SSPI packets (type 0x11) after LOGIN7 and expose the LOGIN7
+      SSPI blob (`cbSSPILong` in the extension block when > 64 KB)
+- [ ] Token classifier, bounds-checked ASN.1 DER: SPNEGO NegTokenInit /
+      NegTokenResp, GSS krb5 framing (OID + TOK_ID 0x0100) to the AP-REQ, raw
+      `NTLMSSP\0`; the mechanism is that of the optimistic token
+- [ ] Server login-response parser (SSPI 0xED, LOGINACK 0xAD, ERROR 0xAA,
+      ENVCHANGE 0xE3, DONE 0xFD), held to EOM to see the outcome; builds on the
+      Phase 2 LOGINACK scan
+- [ ] Deny: ERROR 18456 + DONE to the client, then close; early (on the claimed
+      name, before contacting the server) and late (replacing LOGINACK)
+- [ ] Dynamic metadata: `identity`, `auth` (sql / kerberos / ntlm),
+      `auth_mode`, `login_result`; counters per mechanism and result
+- [ ] Routing: `principal` match key (Kerberos modes; known at LOGIN7). NTLM
+      users can't route: they arrive after the backend is chosen
+- [ ] Throwaway MIT realm for tests (`krb5kdc` + `kadmin.local` in a temp dir,
+      installed here): KDC, service and client principals, keytabs, `kinit`
+
+### 5b: NTLM pass-through
 
 The proxy cannot verify NTLM itself and still log the user in: the client's
 response is bound to the server's challenge, so only the challenger can check it.
-The proxy therefore relays the three NTLM messages unchanged and reads the
-identity on the way; the server (via its DC) does the verification.
+The proxy relays the messages unchanged and reads the identity on the way.
 
 - Flow: LOGIN7 (fIntSecurity, SSPI data = NEGOTIATE) -> server SSPI token (0xED,
-  CHALLENGE) -> client SSPI packet (type 0x11, AUTHENTICATE) -> LOGINACK or
-  ERROR 18456.
-- Identity: user, domain and workstation are plaintext fields of AUTHENTICATE
-  (only TLS protects them). It is the client's claim until the server returns
-  LOGINACK; after that it is verified, because user and domain are inputs to the
-  NTLMv2 response.
-- Policy: deny early on the claimed name (safe: a false claim can only cause a
-  deny), and deny late by replacing LOGINACK with ERROR 18456 + DONE and closing
-  both sides. Forward no client traffic upstream until the login result is known.
+  CHALLENGE) -> client SSPI packet (0x11, AUTHENTICATE) -> LOGINACK or ERROR.
+- Identity: user, domain and workstation are plaintext fields of AUTHENTICATE.
+  It is the client's claim until LOGINACK, verified after (user and domain are
+  inputs to the NTLMv2 response).
 
-- [ ] Client side: parse SSPI data in LOGIN7 and SSPI packets (0x11); raw
-      NTLMSSP (`NTLMSSP\0`) or SPNEGO-wrapped (ASN.1 DER)
 - [ ] Bounds-checked AUTHENTICATE parse: every field's offset/length validated;
-      UTF-16LE when NEGOTIATE_UNICODE was negotiated, OEM code page otherwise
-- [ ] Normalise identity: `DOMAIN\user` vs UPN `user@dns.domain` with empty
-      domain; NetBIOS vs DNS domain mapping for policy
-- [ ] Server side: parse the login response token stream (SSPI 0xED, LOGINACK
-      0xAD, ERROR 0xAA, ENVCHANGE 0xE3, DONE 0xFD) and hold it until EOM to see
-      the outcome (shared with Kerberos, which also needs the server's verdict)
-- [ ] Never modify NTLM messages or their SPNEGO wrapper: the NTLMv2 MIC covers
-      NEGOTIATE, CHALLENGE and AUTHENTICATE
-- [ ] Optional policy: reject NTLMv1 (NtChallengeResponse length 24)
-- [ ] Integration test with a SQL Server that accepts NTLM
+      UTF-16LE when NEGOTIATE_UNICODE was negotiated, OEM otherwise
+- [ ] Normalise identity: `DOMAIN\user` vs UPN `user@dns.domain`
+- [ ] Never modify NTLM messages or their SPNEGO wrapper (the MIC covers all
+      three); hold client traffic until the login result is known
+- [ ] `ntlm: deny` refuses NTLM logins early; optional NTLMv1 rejection
+      (NtChallengeResponse length 24)
+- [ ] Unit tests on synthetic messages; integration test with a SQL Server that
+      accepts NTLM (unverified on Linux, see open questions)
 
-Requirements on the deployment:
+Deployment: Extended Protection must be *Off* (AUTHENTICATE carries a channel
+binding of the proxy's certificate; *Allowed* already enforces it for clients
+that support it) unless the proxy presents the SQL Server's own certificate.
+With EPA on, the proxy's SPN must be among SQL Server's accepted NTLM SPNs.
 
-- Extended Protection: AUTHENTICATE carries a channel binding hash of the TLS
-  certificate the client saw (the proxy's). EPA *Allowed* already enforces it for
-  clients that support it, so both *Allowed* and *Required* break unless EPA is
-  *Off* or the proxy presents the SQL Server's own certificate.
-- Service binding: AUTHENTICATE names the SPN the client targeted (proxy host and
-  port); with EPA on, add it to SQL Server's accepted NTLM SPNs.
-- No routing by NTLM user: the username only arrives after the server's
-  challenge, i.e. after the backend is chosen. LOGIN7 fields (database, server
-  name) can still route.
-- With encryption *off* (login-only TLS), the SSPI packet after LOGIN7 should be
-  plaintext per the spec, so the identity is readable even without TLS
-  termination; with encryption on or TDS 8.0 it needs termination (Phase 3).
+Rejected: the proxy authenticating NTLM itself (own challenge, checked with a DC
+via winbind). NTLM can't be delegated, so it would collapse to the shared
+service account of option 2 with none of Kerberos's guarantees, and it needs a
+domain-joined machine account.
 
-Rejected alternative: the proxy authenticates NTLM itself (own challenge,
-validated against a DC via Samba winbind / `ntlm_auth`). NTLM cannot be
-delegated, so the proxy would then have to log in to SQL Server with a shared
-identity, losing per-user permissions and auditing, and it needs a domain-joined
-machine account.
+### 5c: Kerberos read_ticket
+
+The client name is never readable on the wire: in the AP-REQ it is inside the
+ticket's encrypted part (service key) and the authenticator (session key). The
+proxy decrypts the ticket with the keytab (`krb5_decode_ticket`,
+`krb5_server_decrypt_ticket_keytab` / `krb5_decrypt_tkt_part`), which yields the
+KDC-asserted client principal, the session key and the PAC, then decrypts the
+authenticator with the session key to check that its client name matches and
+its time is within the clock skew. It records nothing: replays are caught by the
+server, which receives the same AP-REQ. A ticket is only issued by the KDC, so
+the name is good enough to route and deny on before the server answers; LOGINACK
+still decides success.
+
+- [ ] Decrypt ticket and authenticator; principal, realm, ticket times
+- [ ] Optional: PAC group SIDs for policy
+- [ ] Unit tests with tickets from the throwaway realm: right principal; wrong
+      key, expired ticket, mismatched authenticator rejected
+- [ ] Integration test: a SQL Server that shares the service keytab; the
+      forwarded login succeeds and the proxy logs the right principal
+
+Deployment: the SPN the client targets (the proxy's host and port) must belong
+to the SQL Server's service account, and the proxy holds that account's keytab.
+With routing, every backend a Kerberos login can reach must accept that SPN's
+tickets (same service account, or SPNs registered to it). EPA must be *Off*: the
+authenticator's channel binding is the proxy's certificate.
+
+### 5d: Kerberos terminate
+
+The client authenticates to the proxy (SPN `MSSQLSvc/<proxy>:<port>` registered
+to the proxy's own account); the proxy authenticates to SQL Server separately.
+The client's ticket never reaches the server, so the proxy keeps its replay cache
+on and there is no sharing problem.
+
+Client leg:
+- [ ] `gss_accept_sec_context` with the proxy's keytab
+      (`gss_acquire_cred_from`, no process environment), SPNEGO
+- [ ] Channel binding: pass `tls-server-end-point` of the proxy's certificate,
+      so clients that bind are checked rather than broken
+- [ ] Answer the client: drop the server's SSPI token from the login response
+      and put the proxy's (AP-REP) in its place, re-framing the TDS message
+- [ ] NTLM-only clients: relay per `ntlm` (pass_through) or deny
+
+Server leg:
+- [ ] `identity: delegate`: with an acceptor credential that can also initiate,
+      MIT returns the client's ticket as evidence for S4U2Proxy (constrained
+      delegation, Kerberos-only); `gss_init_sec_context` for the backend SPN with
+      it. SQL Server sees the end user. Needs AD to let the proxy account
+      delegate to the backend SPNs (or RBCD on them) and forwardable tickets
+- [ ] `identity: service_account`: `gss_init_sec_context` with the proxy's own
+      client keytab; SQL Server sees the proxy account, the proxy logs the user
+- [ ] Backend SPN from the routed cluster (`cluster_spns`, default `spn`)
+- [ ] Rewrite LOGIN7: replace the SSPI data, fix offsets and lengths (and
+      `cbSSPILong`); everything else as the client sent it
+- [ ] Channel binding toward the server: `tls-server-end-point` of the server's
+      certificate, so EPA *Required* works on this leg
+- [ ] Verify the server's AP-REP (mutual auth) before passing LOGINACK on
+
+Async: the GSS calls may contact the KDC (S4U2Proxy, service tickets) and block.
+- [ ] Run them on a module-owned worker pool; `readDisable` the connection while
+      a call is pending, resume through the filter's `getScheduler()` (both in
+      the v1.40.2 SDK); a connection closed meanwhile drops the result
+- [ ] Cache the proxy's TGT and service tickets in a per-config memory ccache
+
+- [ ] Tests: unit tests on the LOGIN7 rewrite and login-response substitution;
+      integration test with the throwaway realm (service_account against a SQL
+      Server set up for it; delegate where the KDC supports constrained
+      delegation, see open questions)
+
+### Later
+
+- [ ] Entra token (library 0x01) JWT check against JWKS via `httpCallout`
 
 ## Open questions
 
@@ -363,8 +432,14 @@ machine account.
   `MSSQL_NOTE.md` sets `KRB5RCACHE=none`, which MIT krb5 does not read (only
   `KRB5RCACHENAME`, `KRB5RCACHETYPE`, `KRB5RCACHEDIR`), so the PoC never
   actually disabled it; its backend did not use Kerberos, which hid this. The
-  preferred read-the-ticket model (Phase 5) never touches the replay cache, so
-  this only applies to the full-accept fallback.
+  Phase 5 avoids it in both Kerberos modes: `read_ticket` never runs an
+  acceptor, and `terminate` accepts a ticket the server never sees, so the
+  proxy's cache stays on and no `KRB5RCACHENAME=none:` fallback is needed.
+- Unverified for Kerberos (Phase 5): whether SQL Server on Linux logs in with a
+  plain MIT realm (no AD) via `mssql-conf` keytab, else the integration tests
+  need AD or Samba AD; whether the MIT KDC (DB2 backend) can grant constrained
+  delegation for the `delegate` test, else Samba AD; whether SQL Server checks
+  Kerberos channel binding under EPA, and which binding it expects.
 - Unverified from the handoff: MIT krb5 SPNEGO acceptance of Windows tokens; whether
   SQL Server checks the SPN on proxied logins; which drivers send the FEDAUTH
   channel binding token.
