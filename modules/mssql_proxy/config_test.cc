@@ -3,6 +3,7 @@
 #include <format>
 #include <map>
 #include <string>
+#include <vector>
 
 #include "gtest/gtest.h"
 
@@ -122,6 +123,37 @@ TEST(Config, RejectsBadRouting) {
       {std::format(R"({{{}, "routing": {{"routes": [{{"match": {{"user": 1}}, "cluster": "c"}}]}}}})",
                    kTls),
        "must be a string"},
+  };
+  for (const auto& [json, want] : cases) {
+    std::string error;
+    EXPECT_FALSE(parseFilterConfig(json, kFiles, error)) << json;
+    EXPECT_NE(error.find(want), std::string::npos) << json << " -> " << error;
+  }
+}
+
+TEST(Config, Auth) {
+  std::string error;
+  auto config = parseFilterConfig(
+      std::format(R"({{{}, "auth": {{"ntlm": "deny", "deny": ["sa", "CORP\\old"]}}}})", kTls),
+      kFiles, error);
+  ASSERT_TRUE(config) << error;
+  ASSERT_TRUE(config->auth);
+  EXPECT_FALSE(config->auth->ntlm_allowed);
+  EXPECT_EQ(config->auth->deny, (std::vector<std::string>{"sa", "CORP\\old"}));
+
+  config = parseFilterConfig(std::format(R"({{{}, "auth": {{}}}})", kTls), kFiles, error);
+  ASSERT_TRUE(config) << error;
+  EXPECT_TRUE(config->auth->ntlm_allowed) << "NTLM passes through by default";
+}
+
+TEST(Config, RejectsBadAuth) {
+  const std::map<std::string, std::string> cases = {
+      {R"({"auth": {}})", "auth needs tls"},
+      {std::format(R"({{{}, "auth": []}})", kTls), "auth must be an object"},
+      {std::format(R"({{{}, "auth": {{"kerberos": {{}}}}}})", kTls), "unknown key \"kerberos\""},
+      {std::format(R"({{{}, "auth": {{"ntlm": "relay"}}}})", kTls), "pass_through"},
+      {std::format(R"({{{}, "auth": {{"deny": "sa"}}}})", kTls), "must be a list"},
+      {std::format(R"({{{}, "auth": {{"deny": [""]}}}})", kTls), "non-empty strings"},
   };
   for (const auto& [json, want] : cases) {
     std::string error;

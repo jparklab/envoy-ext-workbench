@@ -267,6 +267,9 @@ struct Harness {
       const std::string_view piece = std::string_view(data).substr(pos, step);
       error = from_client ? bridge.onClientData(piece, out) : bridge.onServerData(piece, out);
       if (error) {
+        if (error->kind == BridgeError::Kind::Denied) {
+          client.receive(out.to_client); // The refusal is meant to be delivered.
+        }
         return;
       }
       to_server_wire += out.to_server;
@@ -530,7 +533,7 @@ TEST(Bridge, RejectsMalformedLogin7) {
 
 // ---------------------------------------------------------------- local PRELOGIN
 
-constexpr BridgeOptions kLocal{.answer_prelogin = true};
+const BridgeOptions kLocal{.answer_prelogin = true};
 
 // Login, then a query and its answer, through a bridge that answered PRELOGIN
 // itself. server_tls: whether the server peer's leg encrypts its answers.
@@ -639,6 +642,125 @@ TEST(LocalPreloginServer, PassesThroughWhenNotOpeningWithPrelogin) {
   EXPECT_FALSE(bridge.parsing());
   EXPECT_TRUE(bridge.upstreamStarted()) << "passthrough connects at once";
   EXPECT_EQ(out.to_server, batch);
+}
+
+// ---------------------------------------------------------------- login policy
+
+std::shared_ptr<const AuthSettings> policy(bool ntlm_allowed, std::vector<std::string> deny) {
+  return std::make_shared<const AuthSettings>(AuthSettings{ntlm_allowed, std::move(deny)});
+}
+
+std::string sspiToken(std::string_view data) {
+  return std::string(1, static_cast<char>(0xed)) + le16(data.size()) + std::string(data);
+}
+
+TEST(Login, ResultFromServer) {
+  Harness h(kEncOff, kEncOff, 0);
+  ASSERT_TRUE(h.connect()) << h.message();
+  h.client.send(kTdsLogin7, login7Payload(), true);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(h.bridge.auth().method(), LoginMethod::Sql);
+  EXPECT_EQ(h.bridge.auth().identity(), "app_user");
+  EXPECT_EQ(h.bridge.auth().result(), LoginResult::Pending);
+  h.server.send(kTdsTabularResult, loginResponse("4096"), false);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(h.bridge.auth().result(), LoginResult::Succeeded);
+}
+
+TEST(Login, ServerRefusal) {
+  Harness h(kEncOn, kEncOn, 0);
+  ASSERT_TRUE(h.connect()) << h.message();
+  h.client.send(kTdsLogin7, login7Payload(), true);
+  ASSERT_TRUE(h.pump()) << h.message();
+  const std::string refusal = buildLoginError(18456, 1, 14, "Login failed for user 'app_user'.");
+  h.server.send(kTdsTabularResult, refusal, true);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(h.client.received, makeTdsMessage(kTdsTabularResult, refusal, 4096));
+  EXPECT_EQ(h.bridge.auth().result(), LoginResult::Failed);
+  EXPECT_EQ(h.bridge.auth().serverError(), 18456u);
+}
+
+struct DenyCase {
+  uint8_t client_enc;
+  uint8_t server_enc;
+  bool local_prelogin;
+  bool login_tls; // The client sends LOGIN7 over TLS.
+};
+
+class Deny : public ::testing::TestWithParam<DenyCase> {};
+
+TEST_P(Deny, RefusesBeforeTheServerSeesLogin7) {
+  const DenyCase c = GetParam();
+  Harness h(c.client_enc, c.server_enc, 7, false, contexts(),
+            BridgeOptions{.answer_prelogin = c.local_prelogin, .auth = policy(true, {"APP_USER"})});
+  ASSERT_TRUE(h.connect()) << h.message();
+  // A LOGIN7 split into several small packets.
+  h.client.send(kTdsLogin7, login7Payload(), c.login_tls, 64);
+  h.pump();
+  ASSERT_TRUE(h.error);
+  EXPECT_EQ(h.error->kind, BridgeError::Kind::Denied) << h.message();
+  EXPECT_EQ(h.bridge.auth().result(), LoginResult::Denied);
+  EXPECT_TRUE(h.server.received.empty()) << "no LOGIN7 packet reaches the server";
+  EXPECT_EQ(h.client.received,
+            makeTdsMessage(kTdsTabularResult,
+                           buildLoginError(18456, 1, 14, "Login failed for user 'app_user'."),
+                           4096));
+}
+
+INSTANTIATE_TEST_SUITE_P(Modes, Deny,
+                         ::testing::Values(DenyCase{kEncOff, kEncOff, false, true},
+                                           DenyCase{kEncOn, kEncOn, false, true},
+                                           DenyCase{kEncNotSup, kEncOff, false, false},
+                                           DenyCase{kEncOn, kEncOn, true, true},
+                                           DenyCase{kEncOff, kEncReq, true, true}));
+
+// An integrated login: LOGIN7 with a Kerberos SPNEGO token, a server SSPI
+// round, then the client's SSPI message, over full encryption.
+TEST(Login, SspiMessagesForwardedWhole) {
+  Harness h(kEncOn, kEncOn, 5, false, contexts(), BridgeOptions{.auth = policy(false, {})});
+  ASSERT_TRUE(h.connect()) << h.message();
+  Login7Fields f;
+  f.user = "";
+  f.integrated = true;
+  f.sspi = spnegoInit({kOidKrb5, kOidNtlm}, krb5Token(0x0100, std::string(3000, 'k')));
+  f.sspi_long = true;
+  h.client.send(kTdsLogin7, login7Payload(f), true, 512);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(h.server.received, makeTdsMessage(kTdsLogin7, login7Payload(f), 512));
+  EXPECT_EQ(h.bridge.auth().method(), LoginMethod::Kerberos);
+
+  h.server.send(kTdsTabularResult, sspiToken("server-token") + done(), true);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(h.bridge.auth().result(), LoginResult::Pending);
+
+  h.server.received.clear();
+  const std::string next = spnegoResp(krb5Token(0x0100, std::string(2000, 'c')));
+  h.client.send(kTdsSspi, next, true, 512);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(h.server.received, makeTdsMessage(kTdsSspi, next, 512));
+}
+
+TEST(Login, NtlmRefusedWhenTheClientSwitchesToIt) {
+  Harness h(kEncOff, kEncOff, 0, false, contexts(), BridgeOptions{.auth = policy(false, {})});
+  ASSERT_TRUE(h.connect()) << h.message();
+  Login7Fields f;
+  f.user = "";
+  f.integrated = true;
+  f.sspi = spnegoInit({kOidKrb5, kOidNtlm}, krb5Token());
+  h.client.send(kTdsLogin7, login7Payload(f), true);
+  ASSERT_TRUE(h.pump()) << h.message();
+  h.server.send(kTdsTabularResult, sspiToken("negotiate-ntlm") + done(), false);
+  ASSERT_TRUE(h.pump()) << h.message();
+
+  h.server.received.clear();
+  h.client.received.clear();
+  h.client.send(kTdsSspi, spnegoResp(ntlmMessage(3)), false);
+  h.pump();
+  ASSERT_TRUE(h.error);
+  EXPECT_EQ(h.error->kind, BridgeError::Kind::Denied);
+  EXPECT_TRUE(h.server.received.empty()) << "the NTLM message must not reach the server";
+  EXPECT_EQ(h.bridge.auth().method(), LoginMethod::Ntlm);
+  EXPECT_NE(h.client.received.find(utf16("Login failed")), std::string::npos);
 }
 
 } // namespace

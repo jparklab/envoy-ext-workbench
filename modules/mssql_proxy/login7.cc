@@ -9,6 +9,7 @@ namespace {
 // Fixed part of LOGIN7 up to cbSSPI, as in TDS 7.1; TDS 7.2+ adds
 // AtchDBFile, ChangePassword and cbSSPILong (94 bytes).
 constexpr size_t kLogin7FixedSize = 86;
+constexpr size_t kLogin7FixedSize72 = 94;
 // Each string field holds at most 128 characters (MS-TDS 2.2.6.4).
 constexpr size_t kMaxFieldChars = 128;
 
@@ -107,14 +108,19 @@ std::optional<Login7> parseLogin7(std::string_view payload, std::string& error) 
       !field("database", 68, out.database)) {
     return std::nullopt;
   }
-  // The password (44) is deliberately not read. SSPI data: (offset, bytes).
+  // The password (44) is deliberately not read. SSPI data: (offset, bytes);
+  // a count of 0xFFFF means the real one is cbSSPILong (TDS 7.2+, at 90).
   const size_t sspi_offset = le16(login, 78);
-  const size_t sspi_bytes = le16(login, 80);
+  size_t sspi_bytes = le16(login, 80);
+  if (sspi_bytes == 0xffff && login.size() >= kLogin7FixedSize72) {
+    sspi_bytes = le32(login, 90);
+  }
   if (sspi_offset > login.size() || sspi_bytes > login.size() - sspi_offset) {
     error = "LOGIN7 SSPI data out of bounds";
     return std::nullopt;
   }
   out.has_sspi = sspi_bytes > 0;
+  out.sspi = std::string(login.substr(sspi_offset, sspi_bytes));
   return out;
 }
 

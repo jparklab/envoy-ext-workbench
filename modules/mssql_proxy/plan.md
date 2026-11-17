@@ -282,24 +282,32 @@ no clash. The `.so` then needs those libraries on the Envoy host.
 
 ### 5a: Shared pieces
 
-- [ ] `auth` config: parse and validate, `auth needs tls`, keytabs readable at
-      load (a key for the configured SPN present)
-- [ ] Bridge: carry SSPI packets (type 0x11) after LOGIN7 and expose the LOGIN7
-      SSPI blob (`cbSSPILong` in the extension block when > 64 KB)
-- [ ] Token classifier, bounds-checked ASN.1 DER: SPNEGO NegTokenInit /
-      NegTokenResp, GSS krb5 framing (OID + TOK_ID 0x0100) to the AP-REQ, raw
-      `NTLMSSP\0`; the mechanism is that of the optimistic token
-- [ ] Server login-response parser (SSPI 0xED, LOGINACK 0xAD, ERROR 0xAA,
-      ENVCHANGE 0xE3, DONE 0xFD), held to EOM to see the outcome; builds on the
-      Phase 2 LOGINACK scan
-- [ ] Deny: ERROR 18456 + DONE to the client, then close; early (on the claimed
-      name, before contacting the server) and late (replacing LOGINACK)
-- [ ] Dynamic metadata: `identity`, `auth` (sql / kerberos / ntlm),
-      `auth_mode`, `login_result`; counters per mechanism and result
-- [ ] Routing: `principal` match key (Kerberos modes; known at LOGIN7). NTLM
-      users can't route: they arrive after the backend is chosen
-- [ ] Throwaway MIT realm for tests (`krb5kdc` + `kadmin.local` in a temp dir,
-      installed here): KDC, service and client principals, keytabs, `kinit`
+- [x] `auth` config: `ntlm` (pass_through / deny) and `deny`, `auth needs tls`;
+      the Kerberos keys and keytab checks come with 5c and 5d
+- [x] Bridge: LOGIN7 and client SSPI messages (type 0x11) held until complete
+      and checked before they go on; LOGIN7 SSPI data exposed (`cbSSPILong`
+      when it doesn't fit 16 bits)
+- [x] Token classifier, bounds-checked ASN.1 DER: SPNEGO NegTokenInit /
+      NegTokenResp, GSS krb5 framing (OID + TOK_ID) to the Kerberos message, raw
+      `NTLMSSP\0`; the mechanism is that of the token carried, so a SPNEGO
+      fallback from Kerberos to NTLM is seen
+- [x] Login-response scan reports the server's SSPI token and ERROR number;
+      the login result (succeeded / failed) follows from it
+- [x] Deny: ERROR 18456 + DONE to the client (encrypted as its leg needs),
+      then close with flush; nothing of the refused login reaches the server,
+      and with routing no upstream connection is opened. Only early denial: every
+      identity is known before the server's verdict, so replacing LOGINACK
+      isn't needed
+- [x] Dynamic metadata: `auth` (sql / kerberos / ntlm / integrated /
+      federated), `identity`, `login_result`, `server_error`; counters per
+      result and per method
+- [x] Tests: classifier and policy unit tests; bridge tests for refusals in
+      every encryption mode (forwarded and local PRELOGIN), multi-packet SSPI
+      forwarding and an NTLM fallback refused; the server test refuses a login
+      by name in the terminating and routing passes and checks the access log
+
+Not done here: holding the server's login response to EOM before forwarding
+(only needed to substitute SSPI tokens, in 5d).
 
 ### 5b: NTLM pass-through
 
@@ -346,7 +354,12 @@ server, which receives the same AP-REQ. A ticket is only issued by the KDC, so
 the name is good enough to route and deny on before the server answers; LOGINACK
 still decides success.
 
+- [ ] Throwaway MIT realm for tests (`krb5kdc` + `kadmin.local` in a temp dir,
+      installed here): KDC, service and client principals, keytabs, `kinit`
+- [ ] `auth.kerberos` config (`mode`, `keytab_file`); keytab read at load with
+      a key for the service checked
 - [ ] Decrypt ticket and authenticator; principal, realm, ticket times
+- [ ] Routing: `principal` match key (known at LOGIN7)
 - [ ] Optional: PAC group SIDs for policy
 - [ ] Unit tests with tickets from the throwaway realm: right principal; wrong
       key, expired ticket, mismatched authenticator rejected

@@ -16,6 +16,10 @@
 //         {"match": {"database": "sales"}, "cluster": "sql_sales"},
 //         {"match": {"user": "etl", "app_name": "loader"}, "cluster": "sql_batch"}
 //       ]
+//     },
+//     "auth": {                             // Login policy; needs "tls".
+//       "ntlm": "pass_through",             // Or "deny"; default pass_through.
+//       "deny": ["sa", "CORP\\svc_old"]     // Identities refused with error 18456.
 //     }
 //   }
 //
@@ -27,6 +31,11 @@
 // database, user, server_name, app_name, client_host, library. A login no
 // route matches goes to tcp_proxy's own cluster.
 //
+// "auth" applies to every TDS 7.x login the module reads (see auth.h): logins
+// it refuses are answered with error 18456 and never reach the server. With
+// "ntlm": "deny", integrated logins whose mechanism isn't recognised are
+// refused too, since they could be NTLM.
+//
 // Unknown keys are rejected, so a typo can't silently disable a setting.
 
 #include <functional>
@@ -36,6 +45,7 @@
 #include <utility>
 #include <vector>
 
+#include "auth.h"
 #include "login7.h"
 #include "tls_bridge.h"
 
@@ -56,6 +66,8 @@ struct FilterConfig {
   std::optional<TlsSettings> tls;
   // Set when the server is picked from LOGIN7.
   std::optional<RoutingConfig> routing;
+  // Set when a login policy is configured.
+  std::optional<AuthSettings> auth;
 };
 
 // The first route whose match fits the login, or nullptr.

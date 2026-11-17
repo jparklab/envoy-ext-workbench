@@ -12,10 +12,12 @@
 //   envoy.tcp_proxy.cluster filter state from the first matching route, so
 //   tcp_proxy (in ON_DOWNSTREAM_DATA mode with delayed route selection)
 //   connects to that cluster.
-// LOGIN7 fields go into dynamic metadata under "mssql_proxy" (see
-// setLoginMetadata), for access logs. Connections whose framing is malformed
-// or breaks the protocol are closed. Authentication comes in a later phase
-// (see plan.md).
+// - with "auth", it applies a login policy (auth.h): refused logins get
+//   error 18456 and the connection is closed without reaching the server.
+// LOGIN7 fields, the login method, the claimed identity and the login result
+// go into dynamic metadata under "mssql_proxy" (see reportLogin), for access
+// logs. Connections whose framing is malformed or breaks the protocol are
+// closed.
 
 #include <format>
 #include <memory>
@@ -34,10 +36,14 @@ namespace Envoy {
 namespace DynamicModules {
 namespace {
 
+using MssqlProxy::AuthSettings;
 using MssqlProxy::BridgeError;
 using MssqlProxy::BridgeOptions;
 using MssqlProxy::BridgeOutput;
 using MssqlProxy::Login7;
+using MssqlProxy::LoginAuth;
+using MssqlProxy::LoginMethod;
+using MssqlProxy::LoginResult;
 using MssqlProxy::RoutingConfig;
 using MssqlProxy::ConnectionTracker;
 using MssqlProxy::EncryptionMode;
@@ -61,6 +67,15 @@ struct Metrics {
   MetricID routed = 0;              // Logins sent to a route's cluster.
   MetricID unrouted = 0;            // Logins no route matched: tcp_proxy's cluster.
   MetricID server_incompatible = 0; // Server's PRELOGIN contradicted the local answer.
+  MetricID login_succeeded = 0;     // The server accepted the login (LOGINACK).
+  MetricID login_failed = 0;        // The server refused it.
+  MetricID login_denied = 0;        // The proxy refused it.
+  // Logins with a known outcome, by method.
+  MetricID method_sql = 0;
+  MetricID method_kerberos = 0;
+  MetricID method_ntlm = 0;
+  MetricID method_integrated = 0; // Mechanism not recognised.
+  MetricID method_federated = 0;
 };
 
 // Settings shared by every connection of one filter config.
@@ -68,6 +83,7 @@ struct Shared {
   Metrics metrics;
   std::shared_ptr<const TlsContexts> tls; // Null when TLS isn't terminated.
   std::optional<RoutingConfig> routing;   // Set when routing on LOGIN7.
+  std::shared_ptr<const AuthSettings> auth; // Null: no login policy.
 };
 
 constexpr std::string_view kMetadataNamespace = "mssql_proxy";
@@ -78,7 +94,8 @@ public:
       : handle_(handle), shared_(shared), metrics_(shared.metrics) {
     if (shared.tls) {
       bridge_ = std::make_unique<TlsBridge>(
-          shared.tls, BridgeOptions{.answer_prelogin = shared.routing.has_value()});
+          shared.tls, BridgeOptions{.answer_prelogin = shared.routing.has_value(),
+                                    .auth = shared.auth});
     } else {
       tracker_ = std::make_unique<ConnectionTracker>();
     }
@@ -136,19 +153,18 @@ private:
       std::optional<BridgeError> error = client ? bridge_->onClientData(chunk.toStringView(), out)
                                                 : bridge_->onServerData(chunk.toStringView(), out);
       if (error) {
-        closeOnError(*error);
         data.drain(data.getSize());
+        reportLogin();
+        if (error->kind == BridgeError::Kind::Denied && !out.to_client.empty()) {
+          handle_.injectWriteData(out.to_client, false); // The refusal.
+        }
+        closeOnError(*error);
         return NetworkFilterStatus::Stop;
       }
     }
     data.drain(data.getSize());
-    if (!login_reported_ && bridge_->login()) {
-      login_reported_ = true;
-      handle_.incrementCounterValue(metrics_.login7_seen, 1);
-      setLoginMetadata(*bridge_->login());
-      if (shared_.routing && !route(*bridge_->login())) {
-        return NetworkFilterStatus::Stop;
-      }
+    if (reportLogin() && shared_.routing && !route(*bridge_->login())) {
+      return NetworkFilterStatus::Stop;
     }
     if (shared_.routing && bridge_->parsing() && !bridge_->upstreamStarted()) {
       // Nothing may reach tcp_proxy before routing: its first data, even
@@ -207,6 +223,65 @@ private:
     return true;
   }
 
+  // Records what the bridge learned about the login since the last call.
+  // True when LOGIN7 was read just now.
+  bool reportLogin() {
+    bool new_login = false;
+    if (!login_reported_ && bridge_->login()) {
+      login_reported_ = true;
+      new_login = true;
+      handle_.incrementCounterValue(metrics_.login7_seen, 1);
+      setLoginMetadata(*bridge_->login());
+    }
+    const LoginAuth& auth = bridge_->auth();
+    if (auth.method() && auth.method() != method_reported_) {
+      method_reported_ = auth.method();
+      handle_.setMetadata(kMetadataNamespace, "auth",
+                          std::string_view(MssqlProxy::loginMethodName(*auth.method())));
+    }
+    if (auth.identity() != identity_reported_) {
+      identity_reported_ = auth.identity();
+      handle_.setMetadata(kMetadataNamespace, "identity", std::string_view(identity_reported_));
+    }
+    if (!result_reported_ && auth.result() != LoginResult::Pending) {
+      result_reported_ = true;
+      const char* result = MssqlProxy::loginResultName(auth.result());
+      handle_.setMetadata(kMetadataNamespace, "login_result", std::string_view(result));
+      if (auth.serverError()) {
+        handle_.setMetadata(kMetadataNamespace, "server_error",
+                            static_cast<double>(*auth.serverError()));
+      }
+      handle_.incrementCounterValue(auth.result() == LoginResult::Succeeded ? metrics_.login_succeeded
+                                    : auth.result() == LoginResult::Failed  ? metrics_.login_failed
+                                                                            : metrics_.login_denied,
+                                    1);
+      if (auth.method()) {
+        handle_.incrementCounterValue(methodCounter(*auth.method()), 1);
+      }
+      DYM_LOG(handle_, LogLevel::Debug, "mssql_proxy: connection {} login {} ({}, '{}')",
+              handle_.getConnectionId(), result,
+              auth.method() ? MssqlProxy::loginMethodName(*auth.method()) : "?",
+              auth.identity());
+    }
+    return new_login;
+  }
+
+  MetricID methodCounter(LoginMethod method) const {
+    switch (method) {
+    case LoginMethod::Sql:
+      return metrics_.method_sql;
+    case LoginMethod::Kerberos:
+      return metrics_.method_kerberos;
+    case LoginMethod::Ntlm:
+      return metrics_.method_ntlm;
+    case LoginMethod::Integrated:
+      return metrics_.method_integrated;
+    case LoginMethod::Federated:
+      return metrics_.method_federated;
+    }
+    return metrics_.method_integrated;
+  }
+
   // LOGIN7 fields for access logs, e.g. %DYNAMIC_METADATA(mssql_proxy:user)%.
   // Never the password.
   void setLoginMetadata(const Login7& login) {
@@ -218,8 +293,6 @@ private:
     for (const auto& [key, value] : fields) {
       handle_.setMetadata(kMetadataNamespace, key, value);
     }
-    handle_.setMetadata(kMetadataNamespace, "auth",
-                        std::string_view(login.integrated ? "integrated" : "sql"));
     handle_.setMetadata(kMetadataNamespace, "tds_version",
                         std::format("0x{:08x}", login.tds_version));
   }
@@ -235,16 +308,24 @@ private:
     case BridgeError::Kind::Protocol:
       close(metrics_.protocol_errors, "mssql_proxy_protocol_error", error.message);
       break;
+    case BridgeError::Kind::Denied:
+      // Counted as a login result; flush so the client reads the refusal.
+      close(std::nullopt, "mssql_proxy_login_denied", error.message,
+            NetworkConnectionCloseType::FlushWrite);
+      break;
     }
   }
 
   // details goes to the access log's connection termination details.
-  void close(MetricID counter, std::string_view details, const std::string& reason) {
-    handle_.incrementCounterValue(counter, 1);
+  void close(std::optional<MetricID> counter, std::string_view details, const std::string& reason,
+             NetworkConnectionCloseType type = NetworkConnectionCloseType::NoFlush) {
+    if (counter) {
+      handle_.incrementCounterValue(*counter, 1);
+    }
     DYM_LOG(handle_, LogLevel::Debug, "mssql_proxy: closing connection {}: {}",
             handle_.getConnectionId(), reason);
     closed_ = true;
-    handle_.closeWithDetails(NetworkConnectionCloseType::NoFlush, details);
+    handle_.closeWithDetails(type, details);
   }
 
   // Counts what was learned about the connection, once each.
@@ -288,6 +369,9 @@ private:
   bool tls_reported_ = false;
   bool client_cert_reported_ = false;
   bool login_reported_ = false;
+  std::optional<LoginMethod> method_reported_;
+  std::string identity_reported_;
+  bool result_reported_ = false;
   bool closed_ = false;
 };
 
@@ -341,8 +425,20 @@ public:
     metrics.routed = counter("mssql_proxy_routed_total");
     metrics.unrouted = counter("mssql_proxy_unrouted_total");
     metrics.server_incompatible = counter("mssql_proxy_server_incompatible_total");
+    metrics.login_succeeded = counter("mssql_proxy_login_succeeded_total");
+    metrics.login_failed = counter("mssql_proxy_login_failed_total");
+    metrics.login_denied = counter("mssql_proxy_login_denied_total");
+    metrics.method_sql = counter("mssql_proxy_login_sql_total");
+    metrics.method_kerberos = counter("mssql_proxy_login_kerberos_total");
+    metrics.method_ntlm = counter("mssql_proxy_login_ntlm_total");
+    metrics.method_integrated = counter("mssql_proxy_login_integrated_total");
+    metrics.method_federated = counter("mssql_proxy_login_federated_total");
+    std::shared_ptr<const AuthSettings> auth;
+    if (config->auth) {
+      auth = std::make_shared<const AuthSettings>(std::move(*config->auth));
+    }
     return std::make_unique<MssqlProxyFilterFactory>(
-        Shared{metrics, std::move(tls), std::move(config->routing)});
+        Shared{metrics, std::move(tls), std::move(config->routing), std::move(auth)});
   }
 };
 

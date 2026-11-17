@@ -90,6 +90,60 @@ inline std::string loginAck() {
   return std::string(1, static_cast<char>(0xad)) + le16(data.size()) + data;
 }
 
+// DER TLV with a single-byte tag.
+inline std::string der(uint8_t tag, std::string_view value) {
+  std::string out(1, static_cast<char>(tag));
+  const size_t n = value.size();
+  if (n < 0x80) {
+    out.push_back(static_cast<char>(n));
+  } else if (n < 0x100) {
+    out += {static_cast<char>(0x81), static_cast<char>(n)};
+  } else {
+    out += {static_cast<char>(0x82), static_cast<char>(n >> 8), static_cast<char>(n & 0xff)};
+  }
+  return out + std::string(value);
+}
+
+// OID contents (DER, without tag and length).
+inline const std::string kOidSpnego{"\x2b\x06\x01\x05\x05\x02", 6};
+inline const std::string kOidKrb5{"\x2a\x86\x48\x86\xf7\x12\x01\x02\x02", 9};
+inline const std::string kOidMsKrb5{"\x2a\x86\x48\x82\xf7\x12\x01\x02\x02", 9};
+inline const std::string kOidNtlm{"\x2b\x06\x01\x04\x01\x82\x37\x02\x02\x0a", 10};
+
+// A GSS Kerberos token: framing, TOK_ID, then a stand-in for the message.
+inline std::string krb5Token(uint16_t tok_id = 0x0100, std::string_view message = "AP-REQ") {
+  std::string inner = der(0x06, kOidKrb5);
+  inner += {static_cast<char>(tok_id >> 8), static_cast<char>(tok_id & 0xff)};
+  inner += message;
+  return der(0x60, inner);
+}
+
+// An NTLMSSP message of the given type (1 NEGOTIATE, 3 AUTHENTICATE), body
+// not filled in.
+inline std::string ntlmMessage(uint8_t type) {
+  return std::string("NTLMSSP\0", 8) + std::string{static_cast<char>(type), 0, 0, 0} +
+         std::string(16, '\0');
+}
+
+// SPNEGO NegTokenInit offering mechs, with an optional mechToken.
+inline std::string spnegoInit(const std::vector<std::string>& mech_oids,
+                              std::optional<std::string> mech_token) {
+  std::string oids;
+  for (const std::string& oid : mech_oids) {
+    oids += der(0x06, oid);
+  }
+  std::string fields = der(0xa0, der(0x30, oids));
+  if (mech_token) {
+    fields += der(0xa2, der(0x04, *mech_token));
+  }
+  return der(0x60, der(0x06, kOidSpnego) + der(0xa0, der(0x30, fields)));
+}
+
+// SPNEGO NegTokenResp with a responseToken (as the client sends it later).
+inline std::string spnegoResp(std::string_view response_token) {
+  return der(0xa1, der(0x30, der(0xa2, der(0x04, response_token))));
+}
+
 inline std::string done() { return std::string(1, static_cast<char>(0xfd)) + std::string(12, '\0'); }
 
 // UTF-16LE of an ASCII string.
@@ -112,6 +166,8 @@ struct Login7Fields {
   std::string language;
   std::string database = "master";
   bool integrated = false;
+  std::string sspi;       // SSPI data (the client's first auth token).
+  bool sspi_long = false; // Give its length in cbSSPILong (cbSSPI 0xFFFF).
   uint32_t tds_version = 0x74000004;
   uint32_t packet_size = 4096;
 };
@@ -146,7 +202,14 @@ inline std::string login7Payload(const Login7Fields& f = {}) {
   str(60, f.library);
   str(64, f.language);
   str(68, f.database);
-  put16(78, kFixed + data.size()); // No SSPI data.
+  put16(78, kFixed + data.size());
+  if (f.sspi_long) {
+    put16(80, 0xffff);
+    put32(90, static_cast<uint32_t>(f.sspi.size()));
+  } else {
+    put16(80, f.sspi.size());
+  }
+  data += f.sspi;
   put32(0, static_cast<uint32_t>(kFixed + data.size()));
   return fixed + data;
 }

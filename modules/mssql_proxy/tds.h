@@ -138,8 +138,19 @@ inline constexpr uint32_t kTdsMinPacketSize = 512;
 struct LoginResponseScan {
   bool login_ack = false;              // LOGINACK token present: login succeeded.
   std::optional<uint32_t> packet_size; // From ENVCHANGE type 4 (packet size).
+  std::optional<uint32_t> error;       // Number of the first ERROR token, e.g. 18456.
+  std::optional<std::string> sspi;     // SSPI token data: the server's next auth token.
   bool fully_scanned = false;          // False when an unknown token stopped the scan.
 };
+
+// An ERROR token (number, state, class, message; ServerName, ProcName empty)
+// followed by DONE with the error bit: what SQL Server sends for a refused
+// login. A TDS 7.2+ layout (8-byte DONE row count, 4-byte line number).
+std::string buildLoginError(uint32_t number, uint8_t state, uint8_t severity,
+                            std::string_view message_utf8);
+
+// UTF-8 to UTF-16LE; invalid bytes become U+FFFD.
+std::string utf8ToUtf16le(std::string_view utf8);
 
 // Walks the tokens of a server message (TDS type 0x04 payload) sent during
 // login: SSPI, ERROR, INFO, LOGINACK, ENVCHANGE, FEATUREEXTACK, SESSIONSTATE,

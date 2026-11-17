@@ -26,6 +26,11 @@
 // Every TDS (or MARS SMP) unit is validated and forwarded whole, re-encoded for
 // the leg it leaves on, whatever its type. A connection that doesn't open with
 // a client PRELOGIN is passed through untouched, as in ConnectionTracker.
+//
+// The login is followed in a LoginAuth (auth.h): LOGIN7 and the client's SSPI
+// messages are held until complete and checked against its policy before they
+// go on; a refused login is answered with ERROR 18456 and never reaches the
+// server.
 
 #include <openssl/ssl.h>
 
@@ -36,6 +41,7 @@
 #include <string>
 #include <string_view>
 
+#include "auth.h"
 #include "login7.h"
 #include "tds.h"
 #include "tds_connection.h"
@@ -75,6 +81,8 @@ struct BridgeOptions {
   // Answer the client's PRELOGIN locally and hold everything for the server
   // until the client's LOGIN7 has been read (see above).
   bool answer_prelogin = false;
+  // Login policy; null means the defaults (allow everything).
+  std::shared_ptr<const AuthSettings> auth;
 };
 
 struct BridgeError {
@@ -82,6 +90,7 @@ struct BridgeError {
     Protocol,     // Malformed TDS or a protocol violation.
     Tls,          // TLS handshake or record failure on either leg.
     Incompatible, // The server's PRELOGIN answer contradicts the local one.
+    Denied,       // The proxy refused the login: send to_client, then close.
   };
   Kind kind;
   std::string message;
@@ -101,7 +110,8 @@ public:
 
   // Feed the bytes received from one side, in order. Appends what to send on
   // to out. On error the connection should be closed; out may then hold
-  // partial output, which should be dropped.
+  // partial output, which should be dropped, except for Denied, whose
+  // to_client carries the refusal and should be sent before closing.
   std::optional<BridgeError> onClientData(std::string_view data, BridgeOutput& out) {
     return feed(Direction::ClientToServer, data, out);
   }
@@ -125,6 +135,8 @@ public:
   // True once anything has been sent toward the server. With answer_prelogin
   // this happens in the call that reads LOGIN7: route before sending it on.
   bool upstreamStarted() const { return upstream_started_; }
+  // How the client logs in, who it claims to be, and the outcome.
+  const LoginAuth& auth() const { return auth_; }
 
 private:
   enum class Stage { Prelogin, Handshake, Tls, Plain };
@@ -179,6 +191,8 @@ private:
   std::optional<BridgeError> decrypt(Direction from, std::string_view record);
   std::optional<BridgeError> onPlainUnit(Direction d, const Unit& unit);
   std::optional<BridgeError> readLogin7(const Unit& unit);
+  std::optional<BridgeError> readClientSspi(const Unit& unit);
+  BridgeError deny(const Denial& denial);
   std::optional<BridgeError> scanLoginMessage(const Unit& unit);
   std::optional<BridgeError> forward(Direction d, std::string_view bytes);
   std::string drainTls(Leg& leg);
@@ -221,8 +235,12 @@ private:
   bool passive_ = false;
   bool client_cert_cleared_ = false;
 
-  std::string login7_message_; // LOGIN7 being assembled.
+  std::string login7_message_; // LOGIN7 being assembled (payload).
+  std::string login7_wire_;    // Its packets, held until the policy allows them.
   std::optional<Login7> login_;
+  std::string sspi_message_; // A client SSPI message being assembled, likewise.
+  std::string sspi_wire_;
+  LoginAuth auth_;
 
   // Scanning the server's login messages for LOGINACK and the packet size.
   bool scanning_login_ = true;

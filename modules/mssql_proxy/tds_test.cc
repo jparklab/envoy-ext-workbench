@@ -406,6 +406,58 @@ std::vector<Event> loadFixture(const std::string& name) {
 }
 
 // Replays a fixture, feeding each event in chunks of `chunk` bytes
+
+TEST(Login7, ReadsSspi) {
+  std::string error;
+  Login7Fields f;
+  f.integrated = true;
+  f.sspi = "token";
+  auto login = parseLogin7(login7Payload(f), error);
+  ASSERT_TRUE(login) << error;
+  EXPECT_TRUE(login->has_sspi);
+  EXPECT_EQ(login->sspi, "token");
+
+  f.sspi = std::string(70000, 's'); // Beyond cbSSPI's 16 bits.
+  f.sspi_long = true;
+  login = parseLogin7(login7Payload(f), error);
+  ASSERT_TRUE(login) << error;
+  EXPECT_EQ(login->sspi.size(), 70000u);
+
+  std::string bad = login7Payload(f);
+  bad[90] = static_cast<char>(0xff); // cbSSPILong past the end.
+  bad[91] = static_cast<char>(0xff);
+  EXPECT_FALSE(parseLogin7(bad, error));
+}
+
+TEST(LoginResponse, SspiAndError) {
+  std::string error;
+  const std::string sspi = std::string(1, static_cast<char>(0xed)) + le16(3) + "tok";
+  auto scan = scanLoginResponse(sspi + done(), error);
+  ASSERT_TRUE(scan) << error;
+  EXPECT_EQ(scan->sspi, "tok");
+  EXPECT_FALSE(scan->login_ack);
+
+  scan = scanLoginResponse(buildLoginError(18456, 1, 14, "Login failed for user 'x'."), error);
+  ASSERT_TRUE(scan) << error;
+  EXPECT_EQ(scan->error, 18456u);
+  EXPECT_TRUE(scan->fully_scanned) << "the built ERROR and DONE tokens are well formed";
+}
+
+TEST(LoginResponse, BuildsLoginError) {
+  const std::string e = buildLoginError(18456, 1, 14, "no");
+  // ERROR, length, number, state, class, MsgText "no", ServerName, ProcName, line.
+  EXPECT_EQ(e.substr(0, 15), std::string("\xaa\x12\x00\x18\x48\x00\x00\x01\x0e\x02\x00n\0o\0", 15));
+  EXPECT_EQ(e.size(), 3u + 18 + 13); // ERROR header, its data, DONE.
+}
+
+TEST(Utf16, FromUtf8) {
+  EXPECT_EQ(utf8ToUtf16le("a\xc3\xa9\xf0\x9f\x98\x80"),
+            std::string("a\0\xe9\0\x3d\xd8\x00\xde", 8));
+  EXPECT_EQ(utf8ToUtf16le("\xff"), std::string("\xfd\xff", 2));
+  EXPECT_EQ(utf16leToUtf8(utf8ToUtf16le("caf\xc3\xa9 \xf0\x9f\x98\x80")),
+            "caf\xc3\xa9 \xf0\x9f\x98\x80");
+}
+
 // (0 = as recorded). Direction order is kept, as on a real connection.
 void replay(ConnectionTracker& t, const std::vector<Event>& events, size_t chunk) {
   for (const Event& e : events) {

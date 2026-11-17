@@ -25,7 +25,9 @@
 # legs (a throwaway proxy certificate toward the clients, verifying the
 # server's certificate upstream); and also routing on LOGIN7
 # (configs/mssql_proxy_routing.yaml), checking the cluster each login reached
-# and the access log.
+# and the access log. The terminating passes also refuse one login by name
+# (filter_config auth.deny) and check that the client gets error 18456 from
+# the module without the server being asked.
 #
 # Set MSSQL_TAP_DIR=<dir> to also record each module-chain connection of the
 # observe pass with Envoy's tap transport socket, as <dir>/<mode>.json (see
@@ -130,6 +132,7 @@ if tls_dir:
         "upstream_ca_file": tls_dir + "/mssql.pem",
         "upstream_server_name": "127.0.0.1",
     }
+    fc["value"]["auth"] = {"deny": ["denied_login"]}
     for f in chain["filters"]:
         for log in f["typed_config"].get("access_log", []):
             log["typed_config"]["path"] = tls_dir + "/access.log"
@@ -225,6 +228,23 @@ run_mode() {
   echo "  ok: $pass: $label"
 }
 
+# A login the module refuses (auth.deny): the client reports error 18456 from
+# the module, and in the route pass no upstream connection is opened.
+run_denied() {
+  local backend0 out
+  backend0="$(stat cluster.mssql_backend.upstream_cx_total | grep . || echo 0)"
+  out="$(SQLCMDPASSWORD=not-a-real-password "$SQLCMD17" -S tcp:127.0.0.1,11433 -U denied_login \
+    -l 10 -h -1 -Q "SELECT 1" 2>&1)" && fail "$pass: denied login succeeded: $out"
+  grep -q "Login failed for user 'denied_login'" <<<"$out" \
+    || fail "$pass: denied login: expected error 18456, got: $out"
+  [[ "$(module_stat login_denied_total)" == 1 ]] || fail "$pass: denial not counted"
+  if [[ "$pass" == route ]]; then
+    [[ "$(stat cluster.mssql_backend.upstream_cx_total | grep . || echo 0)" == "$backend0" ]] \
+      || fail "route: a denied login connected upstream"
+  fi
+  echo "  ok: $pass: login refused by name"
+}
+
 # The client-facing certificate for the terminating pass (throwaway). The
 # clients below either don't verify it (login-only) or trust it (-C).
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=127.0.0.1" \
@@ -281,6 +301,9 @@ for pass in observe terminate route; do
     connections=$(( login_only + full ))
     [[ "$(module_stat tls_terminated_total)" == "$connections" ]] || fail "$pass: TLS not terminated on every connection"
     [[ "$(module_stat login7_seen_total)" == "$connections" ]] || fail "$pass: LOGIN7 not seen on every connection"
+    # Every login reached the server and was accepted, as a SQL login.
+    [[ "$(module_stat login_succeeded_total)" == "$connections" ]] || fail "$pass: login results not seen"
+    [[ "$(module_stat login_sql_total)" == "$connections" ]] || fail "$pass: SQL logins not counted"
   fi
   if [[ "$pass" == route ]]; then
     # The two tempdb logins went to mssql_tempdb, the rest to tcp_proxy's cluster.
@@ -291,12 +314,15 @@ for pass in observe terminate route; do
     [[ "$(stat cluster.mssql_backend.upstream_cx_total)" == $(( connections - 2 + 1 )) ]] \
       || fail "route: mssql_backend not used for the rest (and the strict client)"
   fi
+  [[ "$pass" != observe ]] && run_denied
   stop_envoy
   if [[ "$pass" == route ]]; then
     # The access log carries the LOGIN7 fields (Envoy flushed it on exit).
-    grep -q "cluster=mssql_tempdb user=sa database=tempdb .*auth=sql" "$TMP/access.log" \
+    grep -q "cluster=mssql_tempdb user=sa database=tempdb .*auth=sql result=succeeded" "$TMP/access.log" \
       || fail "route: access log lacks the LOGIN7 fields: $(cat "$TMP/access.log")"
-    echo "  ok: route: access log has LOGIN7 fields"
+    grep -q "user=denied_login .*result=denied details=mssql_proxy_login_denied" "$TMP/access.log" \
+      || fail "route: access log lacks the refused login: $(cat "$TMP/access.log")"
+    echo "  ok: route: access log has LOGIN7 fields and login results"
   fi
 done
 

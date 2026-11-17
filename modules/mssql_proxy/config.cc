@@ -156,6 +156,41 @@ std::optional<RoutingConfig> parseRouting(const Json& routing, std::string& erro
   return config;
 }
 
+std::optional<AuthSettings> parseAuth(const Json& auth, std::string& error) {
+  if (!auth.is_object()) {
+    error = "auth must be an object";
+    return std::nullopt;
+  }
+  if (!checkKeys(auth, "auth", {"ntlm", "deny"}, error)) {
+    return std::nullopt;
+  }
+  AuthSettings settings;
+  if (auto ntlm = getString(auth, "ntlm", "auth", error)) {
+    if (*ntlm == "deny") {
+      settings.ntlm_allowed = false;
+    } else if (*ntlm != "pass_through") {
+      error = "auth.ntlm must be \"pass_through\" or \"deny\"";
+      return std::nullopt;
+    }
+  } else if (!error.empty()) {
+    return std::nullopt;
+  }
+  if (auto deny = auth.find("deny"); deny != auth.end()) {
+    if (!deny->is_array()) {
+      error = "auth.deny must be a list";
+      return std::nullopt;
+    }
+    for (const Json& name : *deny) {
+      if (!name.is_string() || name.get_ref<const std::string&>().empty()) {
+        error = "auth.deny entries must be non-empty strings";
+        return std::nullopt;
+      }
+      settings.deny.push_back(name.get<std::string>());
+    }
+  }
+  return settings;
+}
+
 bool equalsIgnoreCase(std::string_view a, std::string_view b) {
   return std::equal(a.begin(), a.end(), b.begin(), b.end(), [](char x, char y) {
     return std::tolower(static_cast<unsigned char>(x)) == std::tolower(static_cast<unsigned char>(y));
@@ -222,7 +257,7 @@ std::optional<FilterConfig> parseFilterConfig(std::string_view json, const FileR
     error = "filter_config must be a JSON object";
     return std::nullopt;
   }
-  if (!checkKeys(root, "filter_config", {"tls", "routing"}, error)) {
+  if (!checkKeys(root, "filter_config", {"tls", "routing", "auth"}, error)) {
     return std::nullopt;
   }
   if (auto it = root.find("tls"); it != root.end()) {
@@ -240,6 +275,17 @@ std::optional<FilterConfig> parseFilterConfig(std::string_view json, const FileR
     }
     config.routing = parseRouting(*it, error);
     if (!config.routing) {
+      return std::nullopt;
+    }
+  }
+  if (auto it = root.find("auth"); it != root.end()) {
+    if (!config.tls) {
+      // Logins are only readable once TLS is terminated.
+      error = "auth needs tls";
+      return std::nullopt;
+    }
+    config.auth = parseAuth(*it, error);
+    if (!config.auth) {
       return std::nullopt;
     }
   }

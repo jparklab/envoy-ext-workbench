@@ -328,6 +328,18 @@ std::optional<LoginResponseScan> scanLoginResponse(std::string_view payload, std
       pos += len;
       if (token == kLoginAck) {
         scan.login_ack = true;
+      } else if (token == kSspi) {
+        if (!scan.sspi) {
+          scan.sspi = std::string(data);
+        }
+      } else if (token == kError) {
+        if (data.size() < 4) {
+          error = "ERROR token truncated";
+          return std::nullopt;
+        }
+        if (!scan.error) {
+          scan.error = readLe32(data, 0);
+        }
       } else if (token == kEnvChange) {
         if (auto e = parseEnvChange(data, scan)) {
           error = std::move(*e);
@@ -389,6 +401,71 @@ std::optional<LoginResponseScan> scanLoginResponse(std::string_view payload, std
   }
   scan.fully_scanned = true;
   return scan;
+}
+
+std::string utf8ToUtf16le(std::string_view s) {
+  std::string out;
+  auto put = [&](uint32_t u) {
+    out.push_back(static_cast<char>(u & 0xff));
+    out.push_back(static_cast<char>(u >> 8));
+  };
+  for (size_t i = 0; i < s.size();) {
+    const uint8_t b = static_cast<uint8_t>(s[i]);
+    size_t n = b < 0x80 ? 1 : (b >> 5) == 0x6 ? 2 : (b >> 4) == 0xe ? 3 : (b >> 3) == 0x1e ? 4 : 0;
+    uint32_t cp = n == 1 ? b : n == 2 ? (b & 0x1f) : n == 3 ? (b & 0x0f) : (b & 0x07);
+    bool ok = n != 0 && i + n <= s.size();
+    for (size_t k = 1; ok && k < n; ++k) {
+      const uint8_t c = static_cast<uint8_t>(s[i + k]);
+      ok = (c & 0xc0) == 0x80;
+      cp = (cp << 6) | (c & 0x3f);
+    }
+    constexpr uint32_t kMin[] = {0, 0, 0x80, 0x800, 0x10000};
+    if (!ok || cp < kMin[n] || cp > 0x10ffff || (cp >= 0xd800 && cp < 0xe000)) {
+      put(0xfffd);
+      ++i;
+      continue;
+    }
+    if (cp >= 0x10000) {
+      cp -= 0x10000;
+      put(0xd800 + (cp >> 10));
+      put(0xdc00 + (cp & 0x3ff));
+    } else {
+      put(cp);
+    }
+    i += n;
+  }
+  return out;
+}
+
+std::string buildLoginError(uint32_t number, uint8_t state, uint8_t severity,
+                            std::string_view message_utf8) {
+  auto le = [](std::string& s, uint64_t v, int bytes) {
+    for (int i = 0; i < bytes; ++i) {
+      s.push_back(static_cast<char>((v >> (8 * i)) & 0xff));
+    }
+  };
+  std::string text = utf8ToUtf16le(message_utf8);
+  if (text.size() > 2 * 4000) {
+    text.resize(2 * 4000); // A UTF-16 unit boundary; the caller's message is short.
+  }
+  std::string data;
+  le(data, number, 4);
+  data.push_back(static_cast<char>(state));
+  data.push_back(static_cast<char>(severity));
+  le(data, text.size() / 2, 2); // MsgText: US_VARCHAR.
+  data += text;
+  data.push_back(0); // ServerName: empty B_VARCHAR.
+  data.push_back(0); // ProcName: empty B_VARCHAR.
+  le(data, 0, 4);    // LineNumber.
+
+  std::string out(1, static_cast<char>(0xaa)); // ERROR
+  le(out, data.size(), 2);
+  out += data;
+  out.push_back(static_cast<char>(0xfd)); // DONE
+  le(out, 0x0002, 2);                     // DONE_ERROR
+  le(out, 0, 2);                          // CurCmd
+  le(out, 0, 8);                          // DoneRowCount
+  return out;
 }
 
 } // namespace MssqlProxy

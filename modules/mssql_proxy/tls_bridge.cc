@@ -27,6 +27,11 @@ constexpr size_t kMaxPreloginMessage = kTdsMaxPacketSize;
 // A login takes a few server messages (SSPI rounds, then LOGINACK).
 constexpr size_t kMaxLoginMessages = 8;
 constexpr size_t kMaxLoginMessageSize = 64 * 1024;
+// A client SSPI message (MS-TDS caps the SSPI data of LOGIN7 alike).
+constexpr size_t kMaxSspiMessageSize = kMaxLogin7Size;
+// What SQL Server sends for a failed login: error 18456, state 1 (the state
+// clients see), severity 14.
+constexpr uint32_t kLoginFailedError = 18456;
 
 const char* sideName(Direction from) {
   return from == Direction::ClientToServer ? "client" : "server";
@@ -180,7 +185,7 @@ BridgeError incompatible(std::string message) {
 } // namespace
 
 TlsBridge::TlsBridge(std::shared_ptr<const TlsContexts> contexts, BridgeOptions options)
-    : contexts_(std::move(contexts)), options_(options),
+    : contexts_(std::move(contexts)), options_(options), auth_(options_.auth),
       wire_sinks_{Sink(*this, Direction::ClientToServer, false),
                   Sink(*this, Direction::ServerToClient, false)},
       plain_sinks_{Sink(*this, Direction::ClientToServer, true),
@@ -536,9 +541,11 @@ std::optional<BridgeError> TlsBridge::decrypt(Direction from, std::string_view r
 std::optional<BridgeError> TlsBridge::onPlainUnit(Direction d, const Unit& unit) {
   if (d == Direction::ClientToServer) {
     if (!login_) {
-      if (auto error = readLogin7(unit)) {
-        return error;
-      }
+      return readLogin7(unit); // Forwards the message once complete and allowed.
+    }
+    if (auth_.result() == LoginResult::Pending && unit.kind == UnitKind::TdsPacket &&
+        unit.type == kTdsSspi) {
+      return readClientSspi(unit);
     }
   } else if (auto error = scanLoginMessage(unit)) {
     return error;
@@ -555,6 +562,7 @@ std::optional<BridgeError> TlsBridge::readLogin7(const Unit& unit) {
     return protocolError("LOGIN7 too large");
   }
   login7_message_.append(unit.payload());
+  login7_wire_.append(unit.bytes);
   if (!unit.eom) {
     return std::nullopt;
   }
@@ -565,12 +573,47 @@ std::optional<BridgeError> TlsBridge::readLogin7(const Unit& unit) {
   if (!login_) {
     return protocolError(error);
   }
+  if (std::optional<Denial> denial = auth_.onLogin7(*login_)) {
+    return deny(*denial);
+  }
   if (!upstream_started_) {
     // Local PRELOGIN: the server hears from us now, before the held LOGIN7.
     out_->to_server += upstream_prelogin_;
     upstream_started_ = true;
   }
-  return std::nullopt;
+  std::string wire = std::move(login7_wire_);
+  login7_wire_.clear();
+  return forward(Direction::ClientToServer, wire);
+}
+
+std::optional<BridgeError> TlsBridge::readClientSspi(const Unit& unit) {
+  if (sspi_message_.size() + unit.payload().size() > kMaxSspiMessageSize) {
+    return protocolError("SSPI message too large");
+  }
+  sspi_message_.append(unit.payload());
+  sspi_wire_.append(unit.bytes);
+  if (!unit.eom) {
+    return std::nullopt;
+  }
+  std::optional<Denial> denial = auth_.onClientSspi(sspi_message_);
+  sspi_message_.clear();
+  if (denial) {
+    return deny(*denial);
+  }
+  std::string wire = std::move(sspi_wire_);
+  sspi_wire_.clear();
+  return forward(Direction::ClientToServer, wire);
+}
+
+BridgeError TlsBridge::deny(const Denial& denial) {
+  auth_.setDenied();
+  const std::string message = makeTdsMessage(
+      kTdsTabularResult, buildLoginError(kLoginFailedError, 1, 14, denial.client_text),
+      kHandshakePacketSize);
+  if (auto error = forward(Direction::ServerToClient, message)) {
+    return std::move(*error);
+  }
+  return {BridgeError::Kind::Denied, denial.reason};
 }
 
 std::optional<BridgeError> TlsBridge::scanLoginMessage(const Unit& unit) {
@@ -598,6 +641,7 @@ std::optional<BridgeError> TlsBridge::scanLoginMessage(const Unit& unit) {
     packet_size_ = scan->packet_size;
     setMaxPacketSize(*packet_size_);
   }
+  auth_.onServerLoginMessage(*scan);
   if (scan->login_ack || !scan->fully_scanned || ++login_messages_scanned_ >= kMaxLoginMessages) {
     scanning_login_ = false;
   }

@@ -17,12 +17,28 @@ cc_library(
     ],
 )
 
+# Login following and policy: authentication token classification, login
+# method, identity and result; no Envoy dependency.
+cc_library(
+    name = "auth",
+    srcs = [
+        "auth.cc",
+        "gss_token.cc",
+    ],
+    hdrs = [
+        "auth.h",
+        "gss_token.h",
+    ],
+    deps = [":tds"],
+)
+
 # TLS termination on both legs of a TDS 7.x connection; no Envoy dependency.
 cc_library(
     name = "tls_bridge",
     srcs = ["tls_bridge.cc"],
     hdrs = ["tls_bridge.h"],
     deps = [
+        ":auth",
         ":tds",
         "@boringssl//:ssl",
     ],
@@ -43,6 +59,7 @@ envoy_dynamic_module(
     name = "mssql_proxy",
     srcs = ["mssql_proxy.cc"],
     deps = [
+        ":auth",
         ":config",
         ":tds",
         ":tls_bridge",
@@ -80,6 +97,16 @@ cc_test(
     deps = [
         ":test_util",
         ":tls_bridge",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "auth_test",
+    srcs = ["auth_test.cc"],
+    deps = [
+        ":auth",
+        ":test_util",
         "@googletest//:gtest_main",
     ],
 )

@@ -77,7 +77,7 @@ static_resources:
               path: /dev/stdout
               log_format:
                 text_format_source:
-                  inline_string: "%START_TIME% %DOWNSTREAM_REMOTE_ADDRESS% cluster=%UPSTREAM_CLUSTER% user=%DYNAMIC_METADATA(mssql_proxy:user)% database=%DYNAMIC_METADATA(mssql_proxy:database)% app=%DYNAMIC_METADATA(mssql_proxy:app_name)% auth=%DYNAMIC_METADATA(mssql_proxy:auth)% details=%CONNECTION_TERMINATION_DETAILS%\n"
+                  inline_string: "%START_TIME% %DOWNSTREAM_REMOTE_ADDRESS% cluster=%UPSTREAM_CLUSTER% user=%DYNAMIC_METADATA(mssql_proxy:user)% database=%DYNAMIC_METADATA(mssql_proxy:database)% app=%DYNAMIC_METADATA(mssql_proxy:app_name)% auth=%DYNAMIC_METADATA(mssql_proxy:auth)% result=%DYNAMIC_METADATA(mssql_proxy:login_result)% details=%CONNECTION_TERMINATION_DETAILS%\n"
 
   clusters:
   - name: mssql_backend

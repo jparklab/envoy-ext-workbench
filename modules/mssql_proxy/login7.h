@@ -25,6 +25,7 @@ struct Login7 {
   std::string library_name;   // Client interface, e.g. "ODBC".
   std::string language;
   std::string database;       // Initial database; empty for the login's default.
+  std::string sspi;           // SSPI data: the client's first authentication token.
 };
 
 // Largest LOGIN7 message accepted (MS-TDS caps it at 128 KB).
