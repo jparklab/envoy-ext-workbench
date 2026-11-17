@@ -1,0 +1,102 @@
+# mssql_proxy.yaml with LOGIN7 routing: the module answers the client's
+# PRELOGIN itself, terminates its TLS, reads LOGIN7, and only then lets
+# tcp_proxy pick a cluster and connect. Logins to database "tempdb" go to
+# mssql_tempdb, everything else to tcp_proxy's own cluster, mssql_backend.
+# (Both point at the same local SQL Server here; in practice they are
+# different servers.)
+#
+# Needs, beyond mssql_proxy.yaml:
+# - tcp_proxy with upstream_connect_mode ON_DOWNSTREAM_DATA (and
+#   max_early_data_bytes), so it waits for the module's first data;
+# - the runtime flag tcp_proxy_delay_route_selection, so tcp_proxy reads the
+#   module's envoy.tcp_proxy.cluster filter state when that data arrives
+#   rather than at connection open;
+# - TLS files for the module (paths below; tests/mssql_server_test.sh writes
+#   its own throwaway ones).
+# The access log shows the LOGIN7 fields the module put in dynamic metadata.
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }
+
+layered_runtime:
+  layers:
+  - name: static
+    static_layer:
+      envoy.reloadable_features.tcp_proxy_delay_route_selection: true
+
+static_resources:
+  listeners:
+  - name: mssql
+    address:
+      socket_address: { address: 0.0.0.0, port_value: 11433 }
+    listener_filters:
+    - name: envoy.filters.listener.tls_inspector
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
+    filter_chains:
+    - filter_chain_match:
+        transport_protocol: tls
+      filters:
+      - name: envoy.filters.network.tcp_proxy
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+          stat_prefix: mssql_strict
+          cluster: mssql_backend
+    - filter_chain_match:
+        transport_protocol: raw_buffer
+      filters:
+      - name: mssql_proxy
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.dynamic_modules.v3.DynamicModuleNetworkFilter
+          dynamic_module_config:
+            name: mssql_proxy
+          filter_name: mssql_proxy
+          filter_config:
+            "@type": type.googleapis.com/google.protobuf.Struct
+            value:
+              tls:
+                cert_file: /etc/mssql_proxy/proxy.pem
+                key_file: /etc/mssql_proxy/proxy.key
+                upstream_ca_file: /etc/mssql_proxy/sql.pem
+                upstream_server_name: 127.0.0.1
+              routing:
+                routes:
+                - match: { database: tempdb }
+                  cluster: mssql_tempdb
+      - name: envoy.filters.network.tcp_proxy
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+          stat_prefix: mssql
+          cluster: mssql_backend
+          upstream_connect_mode: ON_DOWNSTREAM_DATA
+          max_early_data_bytes: 65536
+          access_log:
+          - name: envoy.access_loggers.file
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.access_loggers.file.v3.FileAccessLog
+              path: /dev/stdout
+              log_format:
+                text_format_source:
+                  inline_string: "%START_TIME% %DOWNSTREAM_REMOTE_ADDRESS% cluster=%UPSTREAM_CLUSTER% user=%DYNAMIC_METADATA(mssql_proxy:user)% database=%DYNAMIC_METADATA(mssql_proxy:database)% app=%DYNAMIC_METADATA(mssql_proxy:app_name)% auth=%DYNAMIC_METADATA(mssql_proxy:auth)% details=%CONNECTION_TERMINATION_DETAILS%\n"
+
+  clusters:
+  - name: mssql_backend
+    connect_timeout: 5s
+    type: STATIC
+    load_assignment:
+      cluster_name: mssql_backend
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address: { address: 127.0.0.1, port_value: 1433 }
+  - name: mssql_tempdb
+    connect_timeout: 5s
+    type: STATIC
+    load_assignment:
+      cluster_name: mssql_tempdb
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address: { address: 127.0.0.1, port_value: 1433 }

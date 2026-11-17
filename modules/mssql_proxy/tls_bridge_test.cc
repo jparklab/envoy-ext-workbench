@@ -232,9 +232,10 @@ private:
 // Each delivery to the bridge is cut into pieces of `chunk` bytes (0: whole).
 struct Harness {
   Harness(uint8_t client_enc, uint8_t server_enc, size_t chunk, bool mars = false,
-          std::shared_ptr<const TlsContexts> ctx = contexts())
-      : client(false, client_enc, mars), server(true, server_enc, mars), bridge(std::move(ctx)),
-        chunk(chunk) {}
+          std::shared_ptr<const TlsContexts> ctx = contexts(), BridgeOptions options = {},
+          std::optional<bool> server_mars = std::nullopt)
+      : client(false, client_enc, mars), server(true, server_enc, server_mars.value_or(mars)),
+        bridge(std::move(ctx), options), chunk(chunk) {}
 
   // Delivers pending bytes until quiet (the server's only unless held back).
   // Returns false on a bridge error.
@@ -336,12 +337,14 @@ TEST_P(BridgeModes, LoginOnly) {
   ASSERT_TRUE(h.server.handshake_done);
   EXPECT_TRUE(h.bridge.tlsEstablished());
 
-  const std::string login7(300, 'L');
+  const std::string login7 = login7Payload();
   h.client.send(kTdsLogin7, login7, /*over_tls=*/true);
   ASSERT_TRUE(h.pump()) << h.message();
   EXPECT_EQ(h.server.received, makeTdsMessage(kTdsLogin7, login7, 4096));
-  EXPECT_EQ(h.bridge.login7Messages(), 1u);
-  EXPECT_EQ(h.to_server_wire.find(login7), std::string::npos) << "LOGIN7 sent in clear";
+  ASSERT_TRUE(h.bridge.login());
+  EXPECT_EQ(h.bridge.login()->user_name, "app_user");
+  EXPECT_EQ(h.to_server_wire.find(utf16("not-a-real-password")), std::string::npos)
+      << "LOGIN7 sent in clear";
 
   // Plain TDS from here on, in both directions.
   h.server.send(kTdsTabularResult, loginResponse("8192"), /*over_tls=*/false);
@@ -360,7 +363,7 @@ TEST_P(BridgeModes, FullReencryptsEveryType) {
   ASSERT_TRUE(h.connect()) << h.message();
   EXPECT_EQ(h.bridge.encryptionMode(), EncryptionMode::Full);
 
-  h.client.send(kTdsLogin7, std::string(200, 'L'), true);
+  h.client.send(kTdsLogin7, login7Payload(), true);
   ASSERT_TRUE(h.pump()) << h.message();
   h.server.send(kTdsTabularResult, loginResponse("8000"), true);
   ASSERT_TRUE(h.pump()) << h.message();
@@ -394,17 +397,17 @@ TEST_P(BridgeModes, NoEncryption) {
   ASSERT_TRUE(h.connect()) << h.message();
   EXPECT_EQ(h.bridge.encryptionMode(), EncryptionMode::None);
   EXPECT_FALSE(h.bridge.tlsEstablished());
-  h.client.send(kTdsLogin7, "login", false);
+  h.client.send(kTdsLogin7, login7Payload(), false);
   ASSERT_TRUE(h.pump()) << h.message();
-  EXPECT_EQ(h.server.received, makeTdsMessage(kTdsLogin7, "login", 4096));
-  EXPECT_EQ(h.bridge.login7Messages(), 1u);
+  EXPECT_EQ(h.server.received, makeTdsMessage(kTdsLogin7, login7Payload(), 4096));
+  EXPECT_TRUE(h.bridge.login());
 }
 
 TEST_P(BridgeModes, Mars) {
   Harness h(kEncOff, kEncOn, GetParam(), /*mars=*/true);
   ASSERT_TRUE(h.connect()) << h.message();
   EXPECT_TRUE(h.bridge.marsEnabled());
-  h.client.send(kTdsLogin7, "login", true);
+  h.client.send(kTdsLogin7, login7Payload(), true);
   ASSERT_TRUE(h.pump()) << h.message();
   // An SMP SYN, then a DATA packet carrying a batch.
   const std::string smps =
@@ -425,13 +428,13 @@ TEST_P(BridgeModes, HoldsLoginUntilServerHandshakeDone) {
   ASSERT_TRUE(h.pump(/*hold_server=*/true)) << h.message();
   ASSERT_TRUE(h.client.handshake_done);
   ASSERT_FALSE(h.bridge.tlsEstablished());
-  h.client.send(kTdsLogin7, "login", true);
+  h.client.send(kTdsLogin7, login7Payload(), true);
   ASSERT_TRUE(h.pump(/*hold_server=*/true)) << h.message();
   EXPECT_TRUE(h.server.received.empty());
 
   ASSERT_TRUE(h.pump()) << h.message();
   EXPECT_TRUE(h.bridge.tlsEstablished());
-  EXPECT_EQ(h.server.received, makeTdsMessage(kTdsLogin7, "login", 4096));
+  EXPECT_EQ(h.server.received, makeTdsMessage(kTdsLogin7, login7Payload(), 4096));
 }
 
 INSTANTIATE_TEST_SUITE_P(Chunks, BridgeModes, ::testing::Values(0, 1, 7, 1000));
@@ -505,6 +508,137 @@ TEST(Bridge, RejectsGarbageInsideTls) {
   h.pump();
   ASSERT_TRUE(h.error);
   EXPECT_EQ(h.error->kind, BridgeError::Kind::Protocol);
+}
+
+TEST(Bridge, RequiresLogin7First) {
+  Harness h(kEncOn, kEncOn, 0);
+  ASSERT_TRUE(h.connect()) << h.message();
+  h.client.send(kTdsSqlBatch, "select 1", true);
+  h.pump();
+  ASSERT_TRUE(h.error);
+  EXPECT_NE(h.error->message.find("expected LOGIN7"), std::string::npos) << h.error->message;
+}
+
+TEST(Bridge, RejectsMalformedLogin7) {
+  Harness h(kEncOn, kEncOn, 0);
+  ASSERT_TRUE(h.connect()) << h.message();
+  h.client.send(kTdsLogin7, login7Payload().substr(0, 60), true);
+  h.pump();
+  ASSERT_TRUE(h.error);
+  EXPECT_EQ(h.error->kind, BridgeError::Kind::Protocol);
+}
+
+// ---------------------------------------------------------------- local PRELOGIN
+
+constexpr BridgeOptions kLocal{.answer_prelogin = true};
+
+// Login, then a query and its answer, through a bridge that answered PRELOGIN
+// itself. server_tls: whether the server peer's leg encrypts its answers.
+void loginAndQuery(Harness& h, bool client_login_tls, bool server_tls, bool client_plain_after) {
+  h.client.start();
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_TRUE(h.to_server_wire.empty()) << "nothing goes to the server before LOGIN7";
+  EXPECT_FALSE(h.bridge.upstreamStarted());
+
+  const std::string login7 = login7Payload();
+  h.client.send(kTdsLogin7, login7, client_login_tls);
+  ASSERT_TRUE(h.pump()) << h.message();
+  ASSERT_TRUE(h.bridge.login());
+  EXPECT_TRUE(h.bridge.upstreamStarted());
+  EXPECT_EQ(h.server.received, makeTdsMessage(kTdsLogin7, login7, 4096));
+
+  const std::string response = loginAck() + envChangePacketSize("4096", "4096") + done();
+  h.server.send(kTdsTabularResult, response, server_tls);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(h.client.received, makeTdsMessage(kTdsTabularResult, response, 4096));
+
+  h.server.received.clear();
+  h.client.send(kTdsSqlBatch, "select 1", !client_plain_after);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(h.server.received, makeTdsMessage(kTdsSqlBatch, "select 1", 4096));
+}
+
+class LocalPrelogin : public ::testing::TestWithParam<size_t> {};
+
+TEST_P(LocalPrelogin, SameModes) {
+  {
+    Harness h(kEncOff, kEncOff, GetParam(), false, contexts(), kLocal);
+    loginAndQuery(h, true, false, true);
+    EXPECT_EQ(h.bridge.encryptionMode(), EncryptionMode::LoginOnly);
+    EXPECT_EQ(h.bridge.serverEncryptionMode(), EncryptionMode::LoginOnly);
+  }
+  {
+    Harness h(kEncOn, kEncOn, GetParam(), false, contexts(), kLocal);
+    loginAndQuery(h, true, true, false);
+    EXPECT_EQ(h.bridge.encryptionMode(), EncryptionMode::Full);
+    EXPECT_EQ(h.bridge.serverEncryptionMode(), EncryptionMode::Full);
+  }
+  {
+    Harness h(kEncNotSup, kEncOff, GetParam(), false, contexts(), kLocal);
+    loginAndQuery(h, false, false, true);
+    EXPECT_EQ(h.bridge.encryptionMode(), EncryptionMode::None);
+  }
+}
+
+TEST_P(LocalPrelogin, LoginOnlyClientFullServer) {
+  // The client is told encryption is off (login-only); the server forces it.
+  Harness h(kEncOff, kEncReq, GetParam(), false, contexts(), kLocal);
+  loginAndQuery(h, true, true, true);
+  EXPECT_EQ(h.bridge.encryptionMode(), EncryptionMode::LoginOnly);
+  EXPECT_EQ(h.bridge.serverEncryptionMode(), EncryptionMode::Full);
+}
+
+TEST_P(LocalPrelogin, UnencryptedClientFullServer) {
+  Harness h(kEncNotSup, kEncReq, GetParam(), false, contexts(), kLocal);
+  h.client.start();
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(h.bridge.encryptionMode(), EncryptionMode::None);
+  h.client.send(kTdsLogin7, login7Payload(), false);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(h.bridge.serverEncryptionMode(), EncryptionMode::Full);
+  EXPECT_EQ(h.server.received, makeTdsMessage(kTdsLogin7, login7Payload(), 4096));
+  EXPECT_EQ(h.to_server_wire.find(utf16("not-a-real-password")), std::string::npos)
+      << "LOGIN7 sent in clear on the encrypted leg";
+}
+
+TEST_P(LocalPrelogin, Mars) {
+  Harness h(kEncOff, kEncOff, GetParam(), /*mars=*/true, contexts(), kLocal);
+  loginAndQuery(h, true, false, true);
+  EXPECT_TRUE(h.bridge.marsEnabled());
+}
+
+INSTANTIATE_TEST_SUITE_P(Chunks, LocalPrelogin, ::testing::Values(0, 1, 7, 1000));
+
+TEST(LocalPreloginServer, RefusedMarsIsIncompatible) {
+  Harness h(kEncOn, kEncOn, 0, /*mars=*/true, contexts(), kLocal, /*server_mars=*/false);
+  h.client.start();
+  ASSERT_TRUE(h.pump()) << h.message();
+  h.client.send(kTdsLogin7, login7Payload(), true);
+  h.pump();
+  ASSERT_TRUE(h.error);
+  EXPECT_EQ(h.error->kind, BridgeError::Kind::Incompatible);
+  EXPECT_NE(h.error->message.find("MARS"), std::string::npos) << h.error->message;
+}
+
+TEST(LocalPreloginServer, UnencryptedServerIsIncompatibleWithEncryptingClient) {
+  Harness h(kEncOn, kEncNotSup, 0, false, contexts(), kLocal);
+  h.client.start();
+  ASSERT_TRUE(h.pump()) << h.message();
+  h.client.send(kTdsLogin7, login7Payload(), true);
+  h.pump();
+  ASSERT_TRUE(h.error);
+  EXPECT_EQ(h.error->kind, BridgeError::Kind::Incompatible);
+  EXPECT_TRUE(h.server.received.empty()) << "LOGIN7 must not reach the server";
+}
+
+TEST(LocalPreloginServer, PassesThroughWhenNotOpeningWithPrelogin) {
+  TlsBridge bridge(contexts(), kLocal);
+  const std::string batch = tdsPacket(kTdsSqlBatch, true, "select 1");
+  BridgeOutput out;
+  ASSERT_FALSE(bridge.onClientData(batch, out));
+  EXPECT_FALSE(bridge.parsing());
+  EXPECT_TRUE(bridge.upstreamStarted()) << "passthrough connects at once";
+  EXPECT_EQ(out.to_server, batch);
 }
 
 } // namespace

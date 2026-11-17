@@ -1,5 +1,6 @@
 #include "config.h"
 
+#include <format>
 #include <map>
 #include <string>
 
@@ -72,6 +73,55 @@ TEST(Config, Rejects) {
       {R"({"tls": {"cert_file": "/c.pem", "key_file": "/k.pem", "upstream_verify": "no"}})",
        "true or false"},
       {R"({"tls": "on"})", "must be an object"},
+  };
+  for (const auto& [json, want] : cases) {
+    std::string error;
+    EXPECT_FALSE(parseFilterConfig(json, kFiles, error)) << json;
+    EXPECT_NE(error.find(want), std::string::npos) << json << " -> " << error;
+  }
+}
+
+constexpr std::string_view kTls =
+    R"("tls": {"cert_file": "/c.pem", "key_file": "/k.pem", "upstream_ca_file": "/ca.pem"})";
+
+TEST(Config, Routing) {
+  std::string error;
+  auto config = parseFilterConfig(std::format(R"({{{}, "routing": {{"routes": [
+      {{"match": {{"database": "Sales", "user": "etl"}}, "cluster": "batch"}},
+      {{"match": {{"database": "sales"}}, "cluster": "sales"}},
+      {{"cluster": "catch_all"}}]}}}})",
+                                              kTls),
+                                  kFiles, error);
+  ASSERT_TRUE(config) << error;
+  ASSERT_TRUE(config->routing);
+  ASSERT_EQ(config->routing->routes.size(), 3u);
+
+  Login7 login;
+  login.database = "SALES";
+  login.user_name = "etl";
+  EXPECT_EQ(selectRoute(*config->routing, login)->cluster, "batch") << "all fields, any case";
+  login.user_name = "other";
+  EXPECT_EQ(selectRoute(*config->routing, login)->cluster, "sales") << "first match wins";
+  login.database = "hr";
+  EXPECT_EQ(selectRoute(*config->routing, login)->cluster, "catch_all") << "empty match";
+
+  config->routing->routes.pop_back();
+  EXPECT_EQ(selectRoute(*config->routing, login), nullptr);
+}
+
+TEST(Config, RejectsBadRouting) {
+  const std::map<std::string, std::string> cases = {
+      {R"({"routing": {"routes": []}})", "routing needs tls"},
+      {std::format(R"({{{}, "routing": []}})", kTls), "routing must be an object"},
+      {std::format(R"({{{}, "routing": {{"routes": {{}}}}}})", kTls), "must be a list"},
+      {std::format(R"({{{}, "routing": {{"routes": [{{"match": {{}}}}]}}}})", kTls),
+       "cluster is required"},
+      {std::format(R"({{{}, "routing": {{"routes": [{{"match": {{"db": "x"}}, "cluster": "c"}}]}}}})",
+                   kTls),
+       "unknown key \"db\""},
+      {std::format(R"({{{}, "routing": {{"routes": [{{"match": {{"user": 1}}, "cluster": "c"}}]}}}})",
+                   kTls),
+       "must be a string"},
   };
   for (const auto& [json, want] : cases) {
     std::string error;

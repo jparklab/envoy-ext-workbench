@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <format>
+#include <utility>
+#include <vector>
 
 namespace MssqlProxy {
 
@@ -136,7 +138,11 @@ std::optional<PreloginOptions> parsePrelogin(std::string_view payload, std::stri
   // Offsets are relative to the start of the payload.
   constexpr uint8_t kTerminator = 0xff;
   constexpr uint8_t kEncryption = 0x01;
+  constexpr uint8_t kInstOpt = 0x02;
+  constexpr uint8_t kThreadId = 0x03;
   constexpr uint8_t kMars = 0x04;
+  constexpr uint8_t kFedAuthRequired = 0x06;
+  constexpr uint8_t kNonce = 0x07;
 
   PreloginOptions options;
   size_t pos = 0;
@@ -175,10 +181,49 @@ std::optional<PreloginOptions> parsePrelogin(std::string_view payload, std::stri
       options.encryption = static_cast<PreloginEncryption>(v);
     } else if (token == kMars && length >= 1) {
       options.mars = value[0] != 0;
+    } else if (token == kInstOpt) {
+      options.instance = std::string(value);
+    } else if (token == kThreadId) {
+      options.thread_id = true;
+    } else if (token == kFedAuthRequired && length >= 1) {
+      options.fedauth_required = static_cast<uint8_t>(value[0]);
+    } else if (token == kNonce) {
+      options.nonce = true;
     }
     pos += 5;
   }
   return options;
+}
+
+std::string buildPreloginResponse(const PreloginOptions& client, PreloginEncryption encryption,
+                                  std::string_view version) {
+  std::vector<std::pair<uint8_t, std::string>> options;
+  options.emplace_back(0x00, std::string(version));
+  options.emplace_back(0x01, std::string(1, static_cast<char>(encryption)));
+  if (client.instance) {
+    options.emplace_back(0x02, std::string(1, '\0'));
+  }
+  if (client.thread_id) {
+    options.emplace_back(0x03, std::string());
+  }
+  if (client.mars) {
+    options.emplace_back(0x04, std::string(1, static_cast<char>(*client.mars ? 1 : 0)));
+  }
+  // Option table, then the values in the same order.
+  const size_t table = options.size() * 5 + 1;
+  std::string head;
+  std::string data;
+  for (const auto& [token, value] : options) {
+    const size_t offset = table + data.size();
+    head.push_back(static_cast<char>(token));
+    head.push_back(static_cast<char>(offset >> 8));
+    head.push_back(static_cast<char>(offset & 0xff));
+    head.push_back(static_cast<char>(value.size() >> 8));
+    head.push_back(static_cast<char>(value.size() & 0xff));
+    data += value;
+  }
+  head.push_back(static_cast<char>(0xff));
+  return head + data;
 }
 
 std::string makeTdsMessage(uint8_t type, std::string_view payload, size_t max_packet) {

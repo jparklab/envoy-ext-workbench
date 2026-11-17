@@ -144,15 +144,50 @@ std::shared_ptr<const TlsContexts> TlsContexts::create(const TlsSettings& settin
   return contexts;
 }
 
-TlsBridge::TlsBridge(std::shared_ptr<const TlsContexts> contexts)
-    : contexts_(std::move(contexts)),
+namespace {
+
+// VERSION in the local PRELOGIN answer: SQL Server 16.0.2000 (2022). Clients
+// learn the real server version from LOGINACK.
+constexpr std::string_view kLocalVersion{"\x10\x00\x07\xd0\x00\x00", 6};
+
+// The mode a client's and a server's ENCRYPTION options lead to.
+EncryptionMode negotiatedMode(PreloginEncryption client, PreloginEncryption server) {
+  if (client == PreloginEncryption::NotSupported || server == PreloginEncryption::NotSupported) {
+    return EncryptionMode::None; // (If the server requires encryption it closes.)
+  }
+  return server == PreloginEncryption::Off ? EncryptionMode::LoginOnly : EncryptionMode::Full;
+}
+
+// The local answer to a client's ENCRYPTION option: what SQL Server answers
+// when it doesn't force encryption.
+PreloginEncryption localEncryption(PreloginEncryption client) {
+  switch (client) {
+  case PreloginEncryption::NotSupported:
+    return PreloginEncryption::NotSupported;
+  case PreloginEncryption::Off:
+    return PreloginEncryption::Off;
+  case PreloginEncryption::On:
+  case PreloginEncryption::Required:
+    break;
+  }
+  return PreloginEncryption::On;
+}
+
+BridgeError incompatible(std::string message) {
+  return {BridgeError::Kind::Incompatible, std::move(message)};
+}
+
+} // namespace
+
+TlsBridge::TlsBridge(std::shared_ptr<const TlsContexts> contexts, BridgeOptions options)
+    : contexts_(std::move(contexts)), options_(options),
       wire_sinks_{Sink(*this, Direction::ClientToServer, false),
                   Sink(*this, Direction::ServerToClient, false)},
       plain_sinks_{Sink(*this, Direction::ClientToServer, true),
                    Sink(*this, Direction::ServerToClient, true)} {}
 
 std::optional<std::string> TlsBridge::Sink::onUnit(const Unit& unit) {
-  std::optional<BridgeError> error = decrypted_ ? bridge_.onPlainUnit(direction_, unit, true)
+  std::optional<BridgeError> error = decrypted_ ? bridge_.onPlainUnit(direction_, unit)
                                                 : bridge_.onWireUnit(direction_, unit);
   if (!error) {
     return std::nullopt;
@@ -186,6 +221,7 @@ std::optional<BridgeError> TlsBridge::feed(Direction d, std::string_view data,
     // Not TDS 7.x after all: send on everything the client sent, untouched.
     out.to_server.append(client_raw_);
     client_raw_.clear();
+    upstream_started_ = true;
     return std::nullopt;
   }
   if (!message) {
@@ -199,8 +235,8 @@ std::optional<BridgeError> TlsBridge::feed(Direction d, std::string_view data,
 }
 
 std::optional<BridgeError> TlsBridge::onWireUnit(Direction d, const Unit& unit) {
-  Stage& stage = stage_[index(d)];
-  const bool client = d == Direction::ClientToServer;
+  const size_t i = index(d);
+  Stage& stage = stage_[i];
   const bool tls = unit.kind == UnitKind::TlsRecord;
 
   switch (stage) {
@@ -223,36 +259,33 @@ std::optional<BridgeError> TlsBridge::onWireUnit(Direction d, const Unit& unit) 
   case Stage::Tls:
     if (tls) {
       // Under login-only the server never sends raw TLS: it answers the
-      // client's encrypted LOGIN7 in plain TDS.
-      if (!client && mode_ == EncryptionMode::LoginOnly) {
+      // encrypted LOGIN7 in plain TDS.
+      if (i == kServer && leg_mode_[i] == EncryptionMode::LoginOnly) {
         return protocolError("raw TLS from the server under login-only encryption");
       }
       return decrypt(d, unit.bytes);
     }
-    if (mode_ == EncryptionMode::LoginOnly) {
-      const Stage other_stage = stage_[index(other(d))];
-      if (!client && other_stage == Stage::Tls) {
-        stage = Stage::Plain; // The login response, after the client's encrypted LOGIN7.
-        return onPlainUnit(d, unit, false);
+    // Under login-only a leg turns plain once the login is under way: the
+    // server answers LOGIN7 in plain TDS, and the client follows once answered.
+    if (leg_mode_[i] == EncryptionMode::LoginOnly && app_sent_[i]) {
+      if (plain_[i].bufferedBytes() != 0) {
+        return protocolError("plain TDS while a TLS-carried packet is incomplete");
       }
-      if (client && other_stage == Stage::Plain) {
-        if (plain_[index(d)].bufferedBytes() != 0) {
-          return protocolError("plain TDS while a TLS-carried packet is incomplete");
-        }
-        stage = Stage::Plain; // Back to plain TDS once the login is answered.
-        return onPlainUnit(d, unit, false);
-      }
+      stage = Stage::Plain;
+      plain_received_[i] = true;
+      return onPlainUnit(d, unit);
     }
     return protocolError(std::format("plain {} type 0x{:02x} after TLS under {} encryption",
                                      unitKindName(unit.kind), unit.type,
-                                     encryptionModeName(mode_)));
+                                     encryptionModeName(leg_mode_[i])));
 
   case Stage::Plain:
     if (tls) {
       return protocolError(std::format("raw TLS record in plain TDS under {} encryption",
-                                       encryptionModeName(mode_)));
+                                       encryptionModeName(leg_mode_[i])));
     }
-    return onPlainUnit(d, unit, false);
+    plain_received_[i] = true;
+    return onPlainUnit(d, unit);
   }
   return std::nullopt;
 }
@@ -262,8 +295,8 @@ std::optional<BridgeError> TlsBridge::onPreloginUnit(Direction d, const Unit& un
   if (client && client_prelogin_) {
     return protocolError("data before the server's PRELOGIN response");
   }
-  if (!client && !client_prelogin_) {
-    return protocolError("data before the client's PRELOGIN");
+  if (!client && !upstream_started_) {
+    return protocolError("data before the PRELOGIN was sent");
   }
   const uint8_t want = client ? kTdsPrelogin : kTdsTabularResult;
   if (unit.kind != UnitKind::TdsPacket || unit.type != want) {
@@ -285,86 +318,144 @@ std::optional<BridgeError> TlsBridge::onPreloginUnit(Direction d, const Unit& un
   }
   std::string payload = std::move(prelogin_payload_);
   prelogin_payload_.clear();
-  return onPreloginMessage(d, payload);
+  return client ? onClientPrelogin(payload) : onServerPrelogin(payload);
 }
 
-std::optional<BridgeError> TlsBridge::onPreloginMessage(Direction d, std::string& payload) {
+std::optional<BridgeError> TlsBridge::onClientPrelogin(std::string& payload) {
   std::string error;
   std::optional<PreloginOptions> options = parsePrelogin(payload, error);
   if (!options) {
     return protocolError(error);
   }
+  if (options->client_cert) {
+    // A certificate login authenticates the client in the TLS handshake,
+    // which ends at this proxy; ask the server for a normal login instead.
+    payload[*options->encryption_offset] &= 0x7f;
+    client_cert_cleared_ = true;
+  }
+  client_prelogin_ = *options;
+  client_raw_.clear();
+  client_raw_.shrink_to_fit();
+  const PreloginEncryption requested = options->encryption.value_or(PreloginEncryption::Off);
+  upstream_encryption_ = requested;
 
-  if (d == Direction::ClientToServer) {
-    if (options->client_cert) {
-      // A certificate login authenticates the client in the TLS handshake,
-      // which ends at this proxy; ask the server for a normal login instead.
-      payload[*options->encryption_offset] &= 0x7f;
-      client_cert_cleared_ = true;
-    }
-    client_prelogin_ = *options;
-    client_raw_.clear();
-    client_raw_.shrink_to_fit();
-    out_->to_server += makeTdsMessage(kTdsPrelogin, payload, kHandshakePacketSize);
+  if (!options_.answer_prelogin) {
+    upstream_prelogin_ = makeTdsMessage(kTdsPrelogin, payload, kHandshakePacketSize);
+    out_->to_server += upstream_prelogin_;
+    upstream_started_ = true;
     return std::nullopt;
   }
-
-  const auto client = client_prelogin_->encryption.value_or(PreloginEncryption::Off);
-  const auto server = options->encryption.value_or(PreloginEncryption::Off);
-  if (client == PreloginEncryption::NotSupported || server == PreloginEncryption::NotSupported) {
-    mode_ = EncryptionMode::None;
-  } else if (server == PreloginEncryption::Off) {
-    mode_ = EncryptionMode::LoginOnly;
-  } else {
-    mode_ = EncryptionMode::Full;
+  // The proxy can always encrypt toward the server, so it asks for at least
+  // login encryption there, even for a client that can't encrypt.
+  if (requested == PreloginEncryption::NotSupported && options->encryption_offset) {
+    payload[*options->encryption_offset] = static_cast<char>(PreloginEncryption::Off);
+    upstream_encryption_ = PreloginEncryption::Off;
   }
-  mars_ = client_prelogin_->mars.value_or(false) && options->mars.value_or(false);
-  for (auto* splitters : {&wire_, &plain_}) {
-    for (StreamSplitter& s : *splitters) {
-      s.setMarsEnabled(mars_);
+  upstream_prelogin_ = makeTdsMessage(kTdsPrelogin, payload, kHandshakePacketSize);
+
+  // Answer locally; the server hears from us once LOGIN7 has been read.
+  const PreloginEncryption answer = localEncryption(requested);
+  leg_mode_[kClient] = negotiatedMode(requested, answer);
+  mars_ = options->mars.value_or(false);
+  setMars(kClient, mars_);
+  out_->to_client += makeTdsMessage(
+      kTdsTabularResult, buildPreloginResponse(*options, answer, kLocalVersion),
+      kHandshakePacketSize);
+  return startLeg(Direction::ClientToServer);
+}
+
+std::optional<BridgeError> TlsBridge::onServerPrelogin(const std::string& payload) {
+  std::string error;
+  std::optional<PreloginOptions> options = parsePrelogin(payload, error);
+  if (!options) {
+    return protocolError(error);
+  }
+  const EncryptionMode mode =
+      negotiatedMode(upstream_encryption_, options->encryption.value_or(PreloginEncryption::Off));
+  const bool mars = client_prelogin_->mars.value_or(false) && options->mars.value_or(false);
+
+  if (!options_.answer_prelogin) {
+    leg_mode_ = {mode, mode};
+    mars_ = mars;
+    setMars(kClient, mars);
+    setMars(kServer, mars);
+    out_->to_client += makeTdsMessage(kTdsTabularResult, payload, kHandshakePacketSize);
+    if (auto e = startLeg(Direction::ClientToServer)) {
+      return e;
     }
-  }
-  out_->to_client += makeTdsMessage(kTdsTabularResult, payload, kHandshakePacketSize);
-
-  if (mode_ == EncryptionMode::None) {
-    stage_ = {Stage::Plain, Stage::Plain};
-    return std::nullopt;
+    return startLeg(Direction::ServerToClient);
   }
 
-  // Both TLS sessions start now: the client's when its ClientHello arrives,
-  // the server's right away with our ClientHello.
+  // The client already has the local answer; the server's must fit it.
+  if (options->instance && !options->instance->empty() && (*options->instance)[0] != 0) {
+    return incompatible("the server rejected the instance name");
+  }
+  if (mars != mars_) {
+    return incompatible("the server refused MARS, which the client was told it has");
+  }
+  if (options->nonce || options->fedauth_required.value_or(0) != 0) {
+    return incompatible("the server asked for federated authentication, which isn't "
+                        "supported when routing on LOGIN7");
+  }
+  if (leg_mode_[kClient] != EncryptionMode::None && mode == EncryptionMode::None) {
+    return incompatible("the server would take the login unencrypted while the client "
+                        "encrypts it");
+  }
+  leg_mode_[kServer] = mode;
+  setMars(kServer, mars);
+  return startLeg(Direction::ServerToClient);
+}
+
+std::optional<BridgeError> TlsBridge::startLeg(Direction from) {
+  const size_t i = index(from);
+  if (leg_mode_[i] == EncryptionMode::None) {
+    stage_[i] = Stage::Plain;
+    return i == kServer ? serverReady() : std::nullopt;
+  }
+  Leg& leg = legOf(from);
   ERR_clear_error();
-  for (auto [leg, ctx] : {std::pair{&down_, contexts_->downstream()},
-                          std::pair{&up_, contexts_->upstream()}}) {
-    leg->ssl.reset(SSL_new(ctx));
-    if (!leg->ssl) {
-      return tlsError(sslError("cannot create a TLS session"));
-    }
-    leg->rbio = BIO_new(BIO_s_mem());
-    leg->wbio = BIO_new(BIO_s_mem());
-    if (leg->rbio == nullptr || leg->wbio == nullptr) {
-      BIO_free(leg->rbio);
-      BIO_free(leg->wbio);
-      leg->rbio = leg->wbio = nullptr;
-      return tlsError(sslError("cannot create TLS buffers"));
-    }
-    SSL_set_bio(leg->ssl.get(), leg->rbio, leg->wbio);
+  leg.ssl.reset(SSL_new(i == kClient ? contexts_->downstream() : contexts_->upstream()));
+  if (!leg.ssl) {
+    return tlsError(sslError("cannot create a TLS session"));
   }
-  SSL_set_accept_state(down_.ssl.get());
-  SSL_set_connect_state(up_.ssl.get());
+  leg.rbio = BIO_new(BIO_s_mem());
+  leg.wbio = BIO_new(BIO_s_mem());
+  if (leg.rbio == nullptr || leg.wbio == nullptr) {
+    BIO_free(leg.rbio);
+    BIO_free(leg.wbio);
+    leg.rbio = leg.wbio = nullptr;
+    return tlsError(sslError("cannot create TLS buffers"));
+  }
+  SSL_set_bio(leg.ssl.get(), leg.rbio, leg.wbio);
+  stage_[i] = Stage::Handshake;
+  if (i == kClient) {
+    SSL_set_accept_state(leg.ssl.get()); // Waits for the client's ClientHello.
+    return std::nullopt;
+  }
+
+  SSL_set_connect_state(leg.ssl.get());
   const std::string& name = contexts_->upstreamServerName();
   if (!name.empty()) {
-    X509_VERIFY_PARAM* param = SSL_get0_param(up_.ssl.get());
+    X509_VERIFY_PARAM* param = SSL_get0_param(leg.ssl.get());
     const bool ok = isIpAddress(name)
                         ? X509_VERIFY_PARAM_set1_ip_asc(param, name.c_str()) == 1
-                        : SSL_set_tlsext_host_name(up_.ssl.get(), name.c_str()) == 1 &&
+                        : SSL_set_tlsext_host_name(leg.ssl.get(), name.c_str()) == 1 &&
                               X509_VERIFY_PARAM_set1_host(param, name.data(), name.size()) == 1;
     if (!ok) {
       return tlsError(sslError("cannot set the upstream server name"));
     }
   }
-  stage_ = {Stage::Handshake, Stage::Handshake};
-  return driveHandshake(Direction::ServerToClient);
+  return driveHandshake(from); // Our ClientHello.
+}
+
+std::optional<BridgeError> TlsBridge::serverReady() {
+  server_ready_ = true;
+  if (pending_to_server_.empty()) {
+    return std::nullopt;
+  }
+  std::string pending = std::move(pending_to_server_);
+  pending_to_server_.clear();
+  return forward(Direction::ClientToServer, pending);
 }
 
 std::optional<BridgeError> TlsBridge::driveHandshake(Direction from) {
@@ -381,12 +472,7 @@ std::optional<BridgeError> TlsBridge::driveHandshake(Direction from) {
     if (BIO_pending(leg.rbio) != 0) {
       return protocolError("data after the TLS handshake in a PRELOGIN packet");
     }
-    if (from == Direction::ServerToClient && !pending_to_server_.empty()) {
-      std::string pending = std::move(pending_to_server_);
-      pending_to_server_.clear();
-      return sendEncrypted(Direction::ClientToServer, pending);
-    }
-    return std::nullopt;
+    return index(from) == kServer ? serverReady() : std::nullopt;
   }
   if (SSL_get_error(leg.ssl.get(), result) == SSL_ERROR_WANT_READ) {
     return std::nullopt;
@@ -447,19 +533,43 @@ std::optional<BridgeError> TlsBridge::decrypt(Direction from, std::string_view r
   return std::nullopt;
 }
 
-std::optional<BridgeError> TlsBridge::onPlainUnit(Direction d, const Unit& unit, bool decrypted) {
+std::optional<BridgeError> TlsBridge::onPlainUnit(Direction d, const Unit& unit) {
   if (d == Direction::ClientToServer) {
-    if (unit.kind == UnitKind::TdsPacket && unit.type == kTdsLogin7 && unit.eom) {
-      login7_messages_++;
+    if (!login_) {
+      if (auto error = readLogin7(unit)) {
+        return error;
+      }
     }
   } else if (auto error = scanLoginMessage(unit)) {
     return error;
   }
-  // Both legs are in the same mode: what arrived over TLS leaves over TLS.
-  if (decrypted) {
-    return sendEncrypted(d, unit.bytes);
+  return forward(d, unit.bytes);
+}
+
+std::optional<BridgeError> TlsBridge::readLogin7(const Unit& unit) {
+  if (unit.kind != UnitKind::TdsPacket || unit.type != kTdsLogin7) {
+    return protocolError(std::format("expected LOGIN7 from the client, got {} type 0x{:02x}",
+                                     unitKindName(unit.kind), unit.type));
   }
-  forwardOutput(d) += unit.bytes;
+  if (login7_message_.size() + unit.payload().size() > kMaxLogin7Size) {
+    return protocolError("LOGIN7 too large");
+  }
+  login7_message_.append(unit.payload());
+  if (!unit.eom) {
+    return std::nullopt;
+  }
+  std::string error;
+  login_ = parseLogin7(login7_message_, error);
+  login7_message_.clear();
+  login7_message_.shrink_to_fit();
+  if (!login_) {
+    return protocolError(error);
+  }
+  if (!upstream_started_) {
+    // Local PRELOGIN: the server hears from us now, before the held LOGIN7.
+    out_->to_server += upstream_prelogin_;
+    upstream_started_ = true;
+  }
   return std::nullopt;
 }
 
@@ -494,27 +604,48 @@ std::optional<BridgeError> TlsBridge::scanLoginMessage(const Unit& unit) {
   return std::nullopt;
 }
 
-std::optional<BridgeError> TlsBridge::sendEncrypted(Direction d, std::string_view plain) {
-  if (d == Direction::ClientToServer && !up_.handshake_done) {
-    if (pending_to_server_.size() + plain.size() > kMaxPendingToServer) {
-      return protocolError("too much client data before the server's TLS handshake finished");
+std::optional<BridgeError> TlsBridge::forward(Direction d, std::string_view bytes) {
+  const size_t to = index(other(d)); // The leg the bytes leave on.
+  if (to == kServer && !server_ready_) {
+    if (pending_to_server_.size() + bytes.size() > kMaxPendingToServer) {
+      return protocolError("too much client data before the server's leg was ready");
     }
-    pending_to_server_.append(plain);
+    pending_to_server_.append(bytes);
     return std::nullopt;
   }
-  Leg& leg = legOf(other(d));
+  bool tls = false;
+  switch (leg_mode_[to]) {
+  case EncryptionMode::Unknown:
+  case EncryptionMode::None:
+    break;
+  case EncryptionMode::Full:
+    tls = true;
+    break;
+  case EncryptionMode::LoginOnly:
+    // The login goes to the server encrypted, until the server answers in
+    // plain TDS; the client side only ever receives plain TDS.
+    tls = to == kServer && !plain_received_[kServer];
+    break;
+  }
+  app_sent_[to] = true;
+  if (!tls) {
+    forwardOutput(d) += bytes;
+    return std::nullopt;
+  }
+  Leg& leg = to == kServer ? up_ : down_;
   if (!leg.handshake_done) {
     return protocolError(std::format("data for the {} before its TLS handshake finished",
-                                     sideName(other(d))));
+                                     to == kServer ? "server" : "client"));
   }
   ERR_clear_error();
-  while (!plain.empty()) {
-    const int n = SSL_write(leg.ssl.get(), plain.data(),
-                            static_cast<int>(std::min<size_t>(plain.size(), INT_MAX)));
+  while (!bytes.empty()) {
+    const int n = SSL_write(leg.ssl.get(), bytes.data(),
+                            static_cast<int>(std::min<size_t>(bytes.size(), INT_MAX)));
     if (n <= 0) {
-      return tlsError(sslError(std::format("TLS write to the {} failed", sideName(other(d)))));
+      return tlsError(sslError(std::format("TLS write to the {} failed",
+                                           to == kServer ? "server" : "client")));
     }
-    plain.remove_prefix(static_cast<size_t>(n));
+    bytes.remove_prefix(static_cast<size_t>(n));
   }
   forwardOutput(d) += drainTls(leg);
   return std::nullopt;
@@ -527,6 +658,11 @@ std::string TlsBridge::drainTls(Leg& leg) {
         std::max(0, BIO_read(leg.wbio, bytes.data(), static_cast<int>(bytes.size())))));
   }
   return bytes;
+}
+
+void TlsBridge::setMars(size_t leg, bool enabled) {
+  wire_[leg].setMarsEnabled(enabled);
+  plain_[leg].setMarsEnabled(enabled);
 }
 
 void TlsBridge::setMaxPacketSize(size_t size) {

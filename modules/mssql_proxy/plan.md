@@ -187,26 +187,59 @@ TLS. Without A2, routing can only use the listener, client IP, or PRELOGIN's
 instance name (module holds PRELOGIN until read); strict clients can use SNI/ALPN
 on their own chain.
 
-- [ ] `upstream_connect_mode: ON_DOWNSTREAM_DATA` with `max_early_data_bytes`, and
+- [x] `upstream_connect_mode: ON_DOWNSTREAM_DATA` with `max_early_data_bytes`, and
       runtime flag `envoy.reloadable_features.tcp_proxy_delay_route_selection:
-      true` (checked in `tcp_proxy.cc`: without it the route is picked at
-      connection open even in this mode, before filter state is set)
-- [ ] Answer the client's PRELOGIN locally and complete client-side TLS (Phase 3)
-- [ ] Bounds-checked LOGIN7 parse (user, database, server name, app name,
-      library type, requested packet size)
-- [ ] Set `envoy.tcp_proxy.cluster` from LOGIN7 fields per `filter_config`
-      routing rules, then release data to `tcp_proxy` so it connects
-- [ ] Send the module's own PRELOGIN upstream, complete server-side TLS, consume
-      the server's PRELOGIN response (the client already has one), forward the
-      real LOGIN7 re-encrypted, relay everything after unchanged
-- [ ] Keep the local PRELOGIN response consistent with what the server will
-      accept (version, encryption, MARS, FEDAUTHREQUIRED: the client builds LOGIN7
-      feature extensions from it); close with an error if the server's answer
-      is incompatible
-- [ ] Access logging: LOGIN7 fields as dynamic metadata under `mssql_proxy`
-      (user, database, server name, app name, client host), usable as
-      `%DYNAMIC_METADATA(mssql_proxy:database)%` in access logs
-- [ ] Integration test with two backend clusters selected by LOGIN7 database
+      true` (`configs/mssql_proxy_routing.yaml`). tcp_proxy connects on its
+      first `onData`, even an empty one, so the module returns Stop (and sends
+      nothing on) until it has routed
+- [x] Answer the client's PRELOGIN locally and complete client-side TLS: the
+      answer mirrors a SQL Server without forced encryption (NOT_SUP -> NOT_SUP,
+      OFF -> OFF, ON -> ON), accepts MARS when asked, reports the instance as
+      valid, VERSION 16.0.2000. Enabled by `routing` in `filter_config`, which
+      requires `tls`
+- [x] Bounds-checked LOGIN7 parse (`login7.h`: user, database, server name, app
+      name, host, library, language, TDS version, packet size, integrated
+      auth flag; the password is never decoded). Read in every terminating
+      mode, not only when routing; a malformed LOGIN7, or anything else as the
+      client's first message, closes the connection
+- [x] Set `envoy.tcp_proxy.cluster` from LOGIN7 fields per `filter_config`
+      routing rules (first match wins; exact match ignoring ASCII case on
+      database, user, server_name, app_name, client_host, library; empty match
+      = catch-all), then release data to `tcp_proxy` so it connects. No match:
+      tcp_proxy's own cluster (`mssql_proxy_routed_total` /
+      `mssql_proxy_unrouted_total`)
+- [x] Send the client's PRELOGIN upstream (client-cert bit cleared; ENCRYPTION
+      raised from NOT_SUP to OFF, so the login is always encrypted toward the
+      server), complete server-side TLS, consume the server's PRELOGIN
+      response, forward the held LOGIN7, relay everything after. The two legs
+      may now differ in encryption mode (e.g. login-only toward the client,
+      full toward a server that forces encryption); each unit is re-encoded
+      for the leg it leaves on
+- [x] Keep the local PRELOGIN response consistent with the server: closed as
+      incompatible (`mssql_proxy_server_incompatible_total`) when the server
+      refuses MARS the client was given, rejects the instance name, asks for
+      federated authentication (NONCE/FEDAUTHREQUIRED), or would take the login
+      unencrypted while the client encrypts it
+- [x] Access logging: LOGIN7 fields as dynamic metadata under `mssql_proxy`
+      (user, database, server_name, app_name, client_host, client_library,
+      auth, tds_version, and cluster when routed), usable as
+      `%DYNAMIC_METADATA(mssql_proxy:database)%`
+- [x] Integration test: `tests/mssql_server_test.sh` "route" pass runs every
+      client through the routing config plus two `-d tempdb` logins (ODBC 17
+      login-only, ODBC 18 full), checks the per-cluster upstream connection
+      counts and the access log
+
+Not done here, left for later:
+- Federated (Entra ID) authentication with routing: the local PRELOGIN answer
+  can't promise FEDAUTHREQUIRED/NONCE before the server is chosen; such logins
+  are closed as incompatible. Case A (no `routing`) still forwards them.
+- A deadline for LOGIN7: before routing there is no upstream, so tcp_proxy's
+  idle timeout may not apply; a client that stops after PRELOGIN holds the
+  connection. Needs a module timer (SDK scheduler) or a listener-level limit.
+- Encryption policy toward clients (e.g. require encryption) and a
+  configurable PRELOGIN VERSION.
+- Matching beyond exact strings (prefix/regex), and rejecting logins that
+  match no route instead of using tcp_proxy's cluster.
 
 ## Phase 5: Authentication
 

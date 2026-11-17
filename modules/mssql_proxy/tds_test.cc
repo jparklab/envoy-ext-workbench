@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "gtest/gtest.h"
+#include "login7.h"
 #include "tds.h"
 #include "tds_connection.h"
 #include "test_util.h"
@@ -172,6 +173,68 @@ TEST(MakeTdsMessage, SplitsIntoPackets) {
   EXPECT_EQ(joined, payload);
   EXPECT_EQ(makeTdsMessage(kTdsSqlBatch, "", 4096), tdsPacket(kTdsSqlBatch, true, ""))
       << "an empty payload is one empty packet";
+}
+
+TEST(Prelogin, BuildsResponseMatchingTheRequest) {
+  std::string error;
+  auto client = parsePrelogin(preloginPayload(0x01, /*mars=*/1), error);
+  ASSERT_TRUE(client) << error;
+  const std::string response =
+      buildPreloginResponse(*client, PreloginEncryption::On, std::string(6, '\x10'));
+  auto parsed = parsePrelogin(response, error);
+  ASSERT_TRUE(parsed) << error;
+  EXPECT_EQ(parsed->encryption, PreloginEncryption::On);
+  EXPECT_EQ(parsed->mars, true);
+  EXPECT_FALSE(parsed->instance) << "the client sent no INSTOPT";
+  EXPECT_FALSE(parsed->nonce);
+}
+
+// ---------------------------------------------------------------- LOGIN7
+
+TEST(Login7, ParsesFields) {
+  Login7Fields f;
+  f.database = "Sales";
+  f.integrated = true;
+  std::string error;
+  auto login = parseLogin7(login7Payload(f), error);
+  ASSERT_TRUE(login) << error;
+  EXPECT_EQ(login->user_name, "app_user");
+  EXPECT_EQ(login->database, "Sales");
+  EXPECT_EQ(login->server_name, "db.test");
+  EXPECT_EQ(login->app_name, "test-app");
+  EXPECT_EQ(login->host_name, "client-host");
+  EXPECT_EQ(login->library_name, "ODBC");
+  EXPECT_EQ(login->tds_version, 0x74000004u);
+  EXPECT_EQ(login->packet_size, 4096u);
+  EXPECT_TRUE(login->integrated);
+  EXPECT_FALSE(login->has_sspi);
+}
+
+TEST(Login7, RejectsMalformed) {
+  std::string error;
+  const std::string good = login7Payload();
+  EXPECT_FALSE(parseLogin7(good.substr(0, 50), error)) << "shorter than the fixed part";
+
+  std::string bad = good;
+  bad[0] = static_cast<char>(0xff); // Length beyond the message.
+  bad[1] = static_cast<char>(0xff);
+  EXPECT_FALSE(parseLogin7(bad, error));
+
+  bad = good;
+  bad[68] = static_cast<char>(0xf0); // Database offset beyond the end.
+  bad[69] = static_cast<char>(0xff);
+  EXPECT_FALSE(parseLogin7(bad, error));
+  EXPECT_NE(error.find("database"), std::string::npos) << error;
+
+  bad = good;
+  bad[42] = static_cast<char>(200); // User name longer than 128 characters.
+  EXPECT_FALSE(parseLogin7(bad, error));
+}
+
+TEST(Login7, ConvertsUtf16) {
+  // "é", "€", U+1F600 as a surrogate pair, and an unpaired surrogate.
+  const std::string utf16le("\xe9\x00\xac\x20\x3d\xd8\x00\xde\x00\xd8", 10);
+  EXPECT_EQ(utf16leToUtf8(utf16le), "\xc3\xa9\xe2\x82\xac\xf0\x9f\x98\x80\xef\xbf\xbd");
 }
 
 // ---------------------------------------------------------------- login response

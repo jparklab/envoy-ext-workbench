@@ -1,14 +1,17 @@
 load("@rules_cc//cc:defs.bzl", "cc_library", "cc_test")
 load("//:defs.bzl", "envoy_dynamic_module")
 
-# TDS framing and connection tracking; no Envoy dependency, so unit-testable.
+# TDS framing, PRELOGIN/LOGIN7 parsing and connection tracking; no Envoy
+# dependency, so unit-testable.
 cc_library(
     name = "tds",
     srcs = [
+        "login7.cc",
         "tds.cc",
         "tds_connection.cc",
     ],
     hdrs = [
+        "login7.h",
         "tds.h",
         "tds_connection.h",
     ],

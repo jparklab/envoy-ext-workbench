@@ -6,14 +6,23 @@
 // - without "tls", it follows each connection's TDS framing and encryption
 //   mode without changing any bytes (ConnectionTracker);
 // - with "tls", it terminates TLS toward the client and opens its own toward
-//   the server, so every message passes through in plain text (TlsBridge).
-// Either way, connections whose framing is malformed or breaks the protocol
-// are closed. LOGIN7 routing and authentication come in later phases (see
-// plan.md).
+//   the server, so every message passes through in plain text (TlsBridge);
+// - with "routing" as well, it answers PRELOGIN itself and holds everything
+//   back from tcp_proxy until it has read LOGIN7, then sets the
+//   envoy.tcp_proxy.cluster filter state from the first matching route, so
+//   tcp_proxy (in ON_DOWNSTREAM_DATA mode with delayed route selection)
+//   connects to that cluster.
+// LOGIN7 fields go into dynamic metadata under "mssql_proxy" (see
+// setLoginMetadata), for access logs. Connections whose framing is malformed
+// or breaks the protocol are closed. Authentication comes in a later phase
+// (see plan.md).
 
+#include <format>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "config.h"
 #include "source/extensions/dynamic_modules/sdk/cpp/sdk.h"
@@ -26,7 +35,10 @@ namespace DynamicModules {
 namespace {
 
 using MssqlProxy::BridgeError;
+using MssqlProxy::BridgeOptions;
 using MssqlProxy::BridgeOutput;
+using MssqlProxy::Login7;
+using MssqlProxy::RoutingConfig;
 using MssqlProxy::ConnectionTracker;
 using MssqlProxy::EncryptionMode;
 using MssqlProxy::TlsBridge;
@@ -46,15 +58,27 @@ struct Metrics {
   MetricID tls_terminated = 0;      // Both TLS handshakes done.
   MetricID login7_seen = 0;         // LOGIN7 messages read in plain text.
   MetricID client_cert_cleared = 0; // Certificate logins turned into normal ones.
+  MetricID routed = 0;              // Logins sent to a route's cluster.
+  MetricID unrouted = 0;            // Logins no route matched: tcp_proxy's cluster.
+  MetricID server_incompatible = 0; // Server's PRELOGIN contradicted the local answer.
 };
+
+// Settings shared by every connection of one filter config.
+struct Shared {
+  Metrics metrics;
+  std::shared_ptr<const TlsContexts> tls; // Null when TLS isn't terminated.
+  std::optional<RoutingConfig> routing;   // Set when routing on LOGIN7.
+};
+
+constexpr std::string_view kMetadataNamespace = "mssql_proxy";
 
 class MssqlProxyFilter : public NetworkFilter {
 public:
-  MssqlProxyFilter(NetworkFilterHandle& handle, const Metrics& metrics,
-                   std::shared_ptr<const TlsContexts> tls)
-      : handle_(handle), metrics_(metrics) {
-    if (tls) {
-      bridge_ = std::make_unique<TlsBridge>(std::move(tls));
+  MssqlProxyFilter(NetworkFilterHandle& handle, const Shared& shared)
+      : handle_(handle), shared_(shared), metrics_(shared.metrics) {
+    if (shared.tls) {
+      bridge_ = std::make_unique<TlsBridge>(
+          shared.tls, BridgeOptions{.answer_prelogin = shared.routing.has_value()});
     } else {
       tracker_ = std::make_unique<ConnectionTracker>();
     }
@@ -112,14 +136,29 @@ private:
       std::optional<BridgeError> error = client ? bridge_->onClientData(chunk.toStringView(), out)
                                                 : bridge_->onServerData(chunk.toStringView(), out);
       if (error) {
-        const bool tls = error->kind == BridgeError::Kind::Tls;
-        close(tls ? metrics_.tls_errors : metrics_.protocol_errors,
-              tls ? "mssql_proxy_tls_error" : "mssql_proxy_protocol_error", error->message);
+        closeOnError(*error);
         data.drain(data.getSize());
         return NetworkFilterStatus::Stop;
       }
     }
     data.drain(data.getSize());
+    if (!login_reported_ && bridge_->login()) {
+      login_reported_ = true;
+      handle_.incrementCounterValue(metrics_.login7_seen, 1);
+      setLoginMetadata(*bridge_->login());
+      if (shared_.routing && !route(*bridge_->login())) {
+        return NetworkFilterStatus::Stop;
+      }
+    }
+    if (shared_.routing && bridge_->parsing() && !bridge_->upstreamStarted()) {
+      // Nothing may reach tcp_proxy before routing: its first data, even
+      // empty, makes it pick the cluster and connect.
+      if (!out.to_client.empty()) {
+        handle_.injectWriteData(out.to_client, false);
+      }
+      reportBridge(was_parsing);
+      return NetworkFilterStatus::Stop;
+    }
     if (client) {
       data.append(out.to_server);
       if (!out.to_client.empty()) {
@@ -132,6 +171,11 @@ private:
       }
     }
 
+    reportBridge(was_parsing);
+    return NetworkFilterStatus::Continue;
+  }
+
+  void reportBridge(bool was_parsing) {
     report(was_parsing, bridge_->parsing(), bridge_->encryptionMode(), bridge_->marsEnabled());
     if (!tls_reported_ && bridge_->tlsEstablished()) {
       tls_reported_ = true;
@@ -141,11 +185,57 @@ private:
       client_cert_reported_ = true;
       handle_.incrementCounterValue(metrics_.client_cert_cleared, 1);
     }
-    if (const uint64_t seen = bridge_->login7Messages(); seen > login7_reported_) {
-      handle_.incrementCounterValue(metrics_.login7_seen, seen - login7_reported_);
-      login7_reported_ = seen;
+  }
+
+  // Points tcp_proxy at the first matching route's cluster. False (connection
+  // closed) when the filter state can't be set.
+  bool route(const Login7& login) {
+    const MssqlProxy::Route* match = MssqlProxy::selectRoute(*shared_.routing, login);
+    if (match == nullptr) {
+      handle_.incrementCounterValue(metrics_.unrouted, 1);
+      return true;
     }
-    return NetworkFilterStatus::Continue;
+    if (!handle_.setFilterStateTyped("envoy.tcp_proxy.cluster", match->cluster)) {
+      close(metrics_.protocol_errors, "mssql_proxy_route_error",
+            "cannot set envoy.tcp_proxy.cluster to " + match->cluster);
+      return false;
+    }
+    handle_.setMetadata(kMetadataNamespace, "cluster", match->cluster);
+    handle_.incrementCounterValue(metrics_.routed, 1);
+    DYM_LOG(handle_, LogLevel::Debug, "mssql_proxy: connection {} routed to {}",
+            handle_.getConnectionId(), match->cluster);
+    return true;
+  }
+
+  // LOGIN7 fields for access logs, e.g. %DYNAMIC_METADATA(mssql_proxy:user)%.
+  // Never the password.
+  void setLoginMetadata(const Login7& login) {
+    const std::pair<std::string_view, const std::string&> fields[] = {
+        {"user", login.user_name},         {"database", login.database},
+        {"server_name", login.server_name}, {"app_name", login.app_name},
+        {"client_host", login.host_name},   {"client_library", login.library_name},
+    };
+    for (const auto& [key, value] : fields) {
+      handle_.setMetadata(kMetadataNamespace, key, value);
+    }
+    handle_.setMetadata(kMetadataNamespace, "auth",
+                        std::string_view(login.integrated ? "integrated" : "sql"));
+    handle_.setMetadata(kMetadataNamespace, "tds_version",
+                        std::format("0x{:08x}", login.tds_version));
+  }
+
+  void closeOnError(const BridgeError& error) {
+    switch (error.kind) {
+    case BridgeError::Kind::Tls:
+      close(metrics_.tls_errors, "mssql_proxy_tls_error", error.message);
+      break;
+    case BridgeError::Kind::Incompatible:
+      close(metrics_.server_incompatible, "mssql_proxy_server_incompatible", error.message);
+      break;
+    case BridgeError::Kind::Protocol:
+      close(metrics_.protocol_errors, "mssql_proxy_protocol_error", error.message);
+      break;
+    }
   }
 
   // details goes to the access log's connection termination details.
@@ -190,28 +280,27 @@ private:
   }
 
   NetworkFilterHandle& handle_;
-  const Metrics& metrics_; // Owned by the factory, which outlives the filter.
+  const Shared& shared_;   // Owned by the factory, which outlives the filter.
+  const Metrics& metrics_; // shared_.metrics
   std::unique_ptr<ConnectionTracker> tracker_; // Observe-only mode.
   std::unique_ptr<TlsBridge> bridge_;          // TLS-terminating mode.
   bool mode_reported_ = false;
   bool tls_reported_ = false;
   bool client_cert_reported_ = false;
-  uint64_t login7_reported_ = 0;
+  bool login_reported_ = false;
   bool closed_ = false;
 };
 
 class MssqlProxyFilterFactory : public NetworkFilterFactory {
 public:
-  MssqlProxyFilterFactory(Metrics metrics, std::shared_ptr<const TlsContexts> tls)
-      : metrics_(metrics), tls_(std::move(tls)) {}
+  explicit MssqlProxyFilterFactory(Shared shared) : shared_(std::move(shared)) {}
 
   std::unique_ptr<NetworkFilter> create(NetworkFilterHandle& handle) override {
-    return std::make_unique<MssqlProxyFilter>(handle, metrics_, tls_);
+    return std::make_unique<MssqlProxyFilter>(handle, shared_);
   }
 
 private:
-  Metrics metrics_;
-  std::shared_ptr<const TlsContexts> tls_; // Null when TLS isn't terminated.
+  Shared shared_;
 };
 
 class MssqlProxyConfigFactory : public NetworkFilterConfigFactory {
@@ -249,7 +338,11 @@ public:
     metrics.tls_terminated = counter("mssql_proxy_tls_terminated_total");
     metrics.login7_seen = counter("mssql_proxy_login7_seen_total");
     metrics.client_cert_cleared = counter("mssql_proxy_client_cert_cleared_total");
-    return std::make_unique<MssqlProxyFilterFactory>(metrics, std::move(tls));
+    metrics.routed = counter("mssql_proxy_routed_total");
+    metrics.unrouted = counter("mssql_proxy_unrouted_total");
+    metrics.server_incompatible = counter("mssql_proxy_server_incompatible_total");
+    return std::make_unique<MssqlProxyFilterFactory>(
+        Shared{metrics, std::move(tls), std::move(config->routing)});
   }
 };
 

@@ -21,7 +21,9 @@
 #         upstream_ca_file: /etc/mssql_proxy/sql.pem  # CAs or the server's own cert
 #         upstream_server_name: sql.example.com     # optional SNI and name check
 #
-# tests/mssql_server_test.sh runs every client both ways.
+# To pick the server from the client's LOGIN7 as well, see
+# mssql_proxy_routing.yaml. tests/mssql_server_test.sh runs every client
+# through all three setups.
 admin:
   address:
     socket_address: { address: 127.0.0.1, port_value: 9901 }

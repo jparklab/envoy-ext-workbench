@@ -1,5 +1,7 @@
 #include "config.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cstring>
 #include <format>
@@ -92,7 +94,106 @@ std::optional<TlsSettings> parseTls(const Json& tls, const FileReader& read_file
   return settings;
 }
 
+constexpr std::string_view kMatchKeys[] = {"database", "user",        "server_name",
+                                           "app_name", "client_host", "library"};
+
+std::optional<RoutingConfig> parseRouting(const Json& routing, std::string& error) {
+  if (!routing.is_object()) {
+    error = "routing must be an object";
+    return std::nullopt;
+  }
+  if (!checkKeys(routing, "routing", {"routes"}, error)) {
+    return std::nullopt;
+  }
+  RoutingConfig config;
+  auto routes = routing.find("routes");
+  if (routes == routing.end()) {
+    return config;
+  }
+  if (!routes->is_array()) {
+    error = "routing.routes must be a list";
+    return std::nullopt;
+  }
+  for (size_t n = 0; n < routes->size(); ++n) {
+    const Json& entry = (*routes)[n];
+    const std::string where = std::format("routing.routes[{}]", n);
+    if (!entry.is_object()) {
+      error = where + " must be an object";
+      return std::nullopt;
+    }
+    if (!checkKeys(entry, where, {"match", "cluster"}, error)) {
+      return std::nullopt;
+    }
+    Route route;
+    std::optional<std::string> cluster = getString(entry, "cluster", where, error);
+    if (!cluster) {
+      if (error.empty()) {
+        error = where + ".cluster is required";
+      }
+      return std::nullopt;
+    }
+    route.cluster = *cluster;
+    if (auto match = entry.find("match"); match != entry.end()) {
+      if (!match->is_object()) {
+        error = where + ".match must be an object";
+        return std::nullopt;
+      }
+      for (const auto& [key, value] : match->items()) {
+        if (std::find(std::begin(kMatchKeys), std::end(kMatchKeys), key) ==
+            std::end(kMatchKeys)) {
+          error = std::format("{}.match: unknown key \"{}\"", where, key);
+          return std::nullopt;
+        }
+        if (!value.is_string()) {
+          error = std::format("{}.match.{} must be a string", where, key);
+          return std::nullopt;
+        }
+        route.match.emplace_back(key, value.get<std::string>());
+      }
+    }
+    config.routes.push_back(std::move(route));
+  }
+  return config;
+}
+
+bool equalsIgnoreCase(std::string_view a, std::string_view b) {
+  return std::equal(a.begin(), a.end(), b.begin(), b.end(), [](char x, char y) {
+    return std::tolower(static_cast<unsigned char>(x)) == std::tolower(static_cast<unsigned char>(y));
+  });
+}
+
+const std::string& loginField(const Login7& login, std::string_view key) {
+  if (key == "database") {
+    return login.database;
+  }
+  if (key == "user") {
+    return login.user_name;
+  }
+  if (key == "server_name") {
+    return login.server_name;
+  }
+  if (key == "app_name") {
+    return login.app_name;
+  }
+  if (key == "client_host") {
+    return login.host_name;
+  }
+  return login.library_name; // "library"; keys are checked at config load.
+}
+
 } // namespace
+
+const Route* selectRoute(const RoutingConfig& routing, const Login7& login) {
+  for (const Route& route : routing.routes) {
+    const bool matches = std::all_of(route.match.begin(), route.match.end(), [&](const auto& m) {
+      return equalsIgnoreCase(loginField(login, m.first), m.second);
+    });
+    if (matches) {
+      return &route;
+    }
+  }
+  return nullptr;
+}
 
 std::optional<std::string> readFile(const std::string& path, std::string& error) {
   std::ifstream in(path, std::ios::binary);
@@ -121,12 +222,24 @@ std::optional<FilterConfig> parseFilterConfig(std::string_view json, const FileR
     error = "filter_config must be a JSON object";
     return std::nullopt;
   }
-  if (!checkKeys(root, "filter_config", {"tls"}, error)) {
+  if (!checkKeys(root, "filter_config", {"tls", "routing"}, error)) {
     return std::nullopt;
   }
   if (auto it = root.find("tls"); it != root.end()) {
     config.tls = parseTls(*it, read_file, error);
     if (!config.tls) {
+      return std::nullopt;
+    }
+  }
+  if (auto it = root.find("routing"); it != root.end()) {
+    if (!config.tls) {
+      // The proxy answers PRELOGIN itself, so it must be able to do the TLS
+      // handshake a client asks for.
+      error = "routing needs tls";
+      return std::nullopt;
+    }
+    config.routing = parseRouting(*it, error);
+    if (!config.routing) {
       return std::nullopt;
     }
   }

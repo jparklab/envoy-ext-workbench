@@ -21,4 +21,8 @@ Progress log against plan.md.
 
 ## Phase 4: LOGIN7 routing (A2)
 
+- [x] 2026-11-17: local PRELOGIN answer and LOGIN7 read before tcp_proxy connects (ON_DOWNSTREAM_DATA with delayed route selection); per-leg encryption modes; server PRELOGIN compatibility checks; LOGIN7 parser; `routing` rules setting `envoy.tcp_proxy.cluster`; LOGIN7 fields in dynamic metadata; unit tests for parser, routing config and the bridge in local-PRELOGIN mode (same and mixed encryption, MARS, incompatible servers); server test adds a routing pass (every client plus tempdb logins routed to a second cluster, access log checked); Phase 4 complete
+
+## Phase 5: Authentication
+
 - [ ] Next up

@@ -107,6 +107,11 @@ struct PreloginOptions {
   bool client_cert = false;
   // Where the ENCRYPTION byte sits in the payload, for rewriting it in place.
   std::optional<size_t> encryption_offset;
+  // INSTOPT: the instance name (client), or 0x00 valid / 0x01 rejected (server).
+  std::optional<std::string> instance;
+  bool thread_id = false;                  // THREADID present.
+  std::optional<uint8_t> fedauth_required; // FEDAUTHREQUIRED.
+  bool nonce = false;                      // NONCEOPT present (federated authentication).
   // MARS option: 1 when requested (client) or accepted (server).
   std::optional<bool> mars;
 };
@@ -115,6 +120,12 @@ struct PreloginOptions {
 // headers removed). Every offset and length is bounds-checked.
 // Returns nullopt and sets error on malformed input.
 std::optional<PreloginOptions> parsePrelogin(std::string_view payload, std::string& error);
+
+// A PRELOGIN response payload answering client: VERSION (version, 6 bytes),
+// ENCRYPTION, and INSTOPT (valid), THREADID (empty) and MARS (as requested)
+// when the client sent them.
+std::string buildPreloginResponse(const PreloginOptions& client, PreloginEncryption encryption,
+                                  std::string_view version);
 
 // Builds a TDS message from a payload: packets of at most max_packet bytes
 // (header included), SPID 0, packet IDs from 1, EOM on the last packet.

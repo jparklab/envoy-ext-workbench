@@ -21,9 +21,11 @@
 # openssl, python3 with PyYAML. Override the image with MSSQL_IMAGE; set
 # MSSQL_MODULE_LOG_LEVEL=debug to log why the module closes connections.
 #
-# Runs twice: with the module observing only, then with it terminating TLS on
-# both legs (a throwaway proxy certificate toward the clients, verifying the
-# server's certificate upstream).
+# Runs three times: with the module observing only; terminating TLS on both
+# legs (a throwaway proxy certificate toward the clients, verifying the
+# server's certificate upstream); and also routing on LOGIN7
+# (configs/mssql_proxy_routing.yaml), checking the cluster each login reached
+# and the access log.
 #
 # Set MSSQL_TAP_DIR=<dir> to also record each module-chain connection of the
 # observe pass with Envoy's tap transport socket, as <dir>/<mode>.json (see
@@ -94,39 +96,43 @@ for _ in $(seq 120); do
 done
 [[ -n "$ready" ]] || fail "SQL Server did not become ready"
 
-# Writes the Envoy config for one pass (observe|terminate): the container's
-# port, the module's TLS settings when terminating, and the tap on the module
-# chain when recording.
+# Writes the Envoy config for one pass: the container's port for every
+# cluster, the module's TLS settings (terminate, route), the access log path
+# (route), and the tap on the module chain when recording (observe).
 TAP_TMP=""
 if [[ -n "${MSSQL_TAP_DIR:-}" ]]; then
   mkdir -p "$MSSQL_TAP_DIR" "$TMP/tap"
   TAP_TMP="$TMP/tap"
 fi
 write_config() {
-  local pass="$1" tap="" tls=""
+  local pass="$1" tap="" tls="" src="$REPO_ROOT/configs/mssql_proxy.yaml"
   [[ "$pass" == observe ]] && tap="$TAP_TMP"
-  [[ "$pass" == terminate ]] && tls="$TMP"
-  python3 -I - "$REPO_ROOT/configs/mssql_proxy.yaml" "$TMP/envoy.yaml" "$port" "$tap" "$tls" <<'EOF' \
+  [[ "$pass" != observe ]] && tls="$TMP"
+  [[ "$pass" == route ]] && src="$REPO_ROOT/configs/mssql_proxy_routing.yaml"
+  python3 -I - "$src" "$TMP/envoy.yaml" "$port" "$tap" "$tls" <<'EOF' \
     || fail "could not write the Envoy config"
 import sys, yaml
 src, dst, port, tap_dir, tls_dir = sys.argv[1:]
 cfg = yaml.safe_load(open(src))
 res = cfg["static_resources"]
-ep = res["clusters"][0]["load_assignment"]["endpoints"][0]["lb_endpoints"][0]["endpoint"]
-ep["address"]["socket_address"]["port_value"] = int(port)
+for cluster in res["clusters"]:
+    ep = cluster["load_assignment"]["endpoints"][0]["lb_endpoints"][0]["endpoint"]
+    ep["address"]["socket_address"]["port_value"] = int(port)
 chain = next(c for c in res["listeners"][0]["filter_chains"]
              if c["filter_chain_match"]["transport_protocol"] == "raw_buffer")
+module = next(f for f in chain["filters"] if f["name"] == "mssql_proxy")
 if tls_dir:
-    module = next(f for f in chain["filters"] if f["name"] == "mssql_proxy")
-    module["typed_config"]["filter_config"] = {
-        "@type": "type.googleapis.com/google.protobuf.Struct",
-        "value": {"tls": {
-            "cert_file": tls_dir + "/proxy.pem",
-            "key_file": tls_dir + "/proxy.key",
-            "upstream_ca_file": tls_dir + "/mssql.pem",
-            "upstream_server_name": "127.0.0.1",
-        }},
+    fc = module["typed_config"].setdefault(
+        "filter_config", {"@type": "type.googleapis.com/google.protobuf.Struct", "value": {}})
+    fc["value"]["tls"] = {
+        "cert_file": tls_dir + "/proxy.pem",
+        "key_file": tls_dir + "/proxy.key",
+        "upstream_ca_file": tls_dir + "/mssql.pem",
+        "upstream_server_name": "127.0.0.1",
     }
+    for f in chain["filters"]:
+        for log in f["typed_config"].get("access_log", []):
+            log["typed_config"]["path"] = tls_dir + "/access.log"
 if tap_dir:
     chain["transport_socket"] = {
         "name": "envoy.transport_sockets.tap",
@@ -175,9 +181,11 @@ module_cx() { module_stat connections_total; }
 strict_cx() { stat "tcp.mssql_strict.downstream_cx_total" | grep . || echo 0; }
 
 QUERY="SET NOCOUNT ON; SELECT encrypt_option, net_transport FROM sys.dm_exec_connections WHERE session_id = @@SPID"
+DB_QUERY="SET NOCOUNT ON; SELECT DB_NAME(), encrypt_option FROM sys.dm_exec_connections WHERE session_id = @@SPID"
 
 # Clients, each running $QUERY and printing the result.
 sqlcmd_query() { "$@" -l 10 -h -1 -Q "$QUERY"; }
+sqlcmd_db_query() { "$@" -l 10 -h -1 -Q "$DB_QUERY"; }
 isql_query() { echo "$QUERY" | isql -b -k "$1"; }
 # Negotiates 512-byte packets and pulls a result set many packets long, so the
 # module enforces the size the login response announced on real traffic.
@@ -224,8 +232,10 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=127.0.0.1" \
   -keyout "$TMP/proxy.key" -out "$TMP/proxy.pem" 2>/dev/null
 
 # Each pass runs every client: "observe" with the module only following the
-# connection, "terminate" with it terminating TLS on both legs.
-for pass in observe terminate; do
+# connection, "terminate" with it terminating TLS on both legs, "route" with it
+# also answering PRELOGIN itself and picking the cluster from LOGIN7
+# (configs/mssql_proxy_routing.yaml: database tempdb -> mssql_tempdb).
+for pass in observe terminate route; do
   start_envoy "$pass"
 
   run_mode odbc17_login_only "ODBC 17, login-only TLS" '^FALSE +TCP' module \
@@ -248,20 +258,46 @@ for pass in observe terminate; do
     echo "  skip: MARS (isql from unixODBC not installed)"
   fi
 
+  if [[ "$pass" == route ]]; then
+    run_mode odbc17_tempdb "ODBC 17, routed by database" '^tempdb +FALSE' module \
+      sqlcmd_db_query "$SQLCMD17" -S tcp:127.0.0.1,11433 -U sa -d tempdb
+    run_mode odbc18_tempdb "ODBC 18, mandatory TLS, routed by database" '^tempdb +TRUE' module \
+      sqlcmd_db_query "$SQLCMD18" -S tcp:127.0.0.1,11433 -U sa -N -C -d tempdb
+    login_only=$(( login_only + 1 ))
+    full=2
+  else
+    full=1
+  fi
+
   # The module followed every TDS 7.x connection's encryption and found no errors.
   [[ "$(module_stat encryption_login_only_total)" == "$login_only" ]] || fail "$pass: login-only connections not recognised"
-  [[ "$(module_stat encryption_full_total)" == 1 ]] || fail "$pass: full-encryption connection not recognised"
+  [[ "$(module_stat encryption_full_total)" == "$full" ]] || fail "$pass: full-encryption connections not recognised"
   [[ "$(module_stat mars_connections_total)" == "$mars" ]] || fail "$pass: MARS connection not recognised"
   [[ "$(module_stat protocol_errors_total)" == 0 ]] || fail "$pass: protocol errors on real clients"
   [[ "$(module_stat tls_errors_total)" == 0 ]] || fail "$pass: TLS errors on real clients"
   [[ "$(module_stat unparsed_connections_total)" == 0 ]] || fail "$pass: real clients left unparsed"
-  if [[ "$pass" == terminate ]]; then
+  if [[ "$pass" != observe ]]; then
     # Every connection had TLS terminated on both legs, and its LOGIN7 read.
-    connections=$(( login_only + 1 ))
-    [[ "$(module_stat tls_terminated_total)" == "$connections" ]] || fail "terminate: TLS not terminated on every connection"
-    [[ "$(module_stat login7_seen_total)" == "$connections" ]] || fail "terminate: LOGIN7 not seen on every connection"
+    connections=$(( login_only + full ))
+    [[ "$(module_stat tls_terminated_total)" == "$connections" ]] || fail "$pass: TLS not terminated on every connection"
+    [[ "$(module_stat login7_seen_total)" == "$connections" ]] || fail "$pass: LOGIN7 not seen on every connection"
+  fi
+  if [[ "$pass" == route ]]; then
+    # The two tempdb logins went to mssql_tempdb, the rest to tcp_proxy's cluster.
+    [[ "$(module_stat routed_total)" == 2 ]] || fail "route: tempdb logins not routed"
+    [[ "$(module_stat unrouted_total)" == $(( connections - 2 )) ]] || fail "route: other logins not left to tcp_proxy"
+    [[ "$(module_stat server_incompatible_total)" == 0 ]] || fail "route: server PRELOGIN answers didn't fit"
+    [[ "$(stat cluster.mssql_tempdb.upstream_cx_total)" == 2 ]] || fail "route: mssql_tempdb not used"
+    [[ "$(stat cluster.mssql_backend.upstream_cx_total)" == $(( connections - 2 + 1 )) ]] \
+      || fail "route: mssql_backend not used for the rest (and the strict client)"
   fi
   stop_envoy
+  if [[ "$pass" == route ]]; then
+    # The access log carries the LOGIN7 fields (Envoy flushed it on exit).
+    grep -q "cluster=mssql_tempdb user=sa database=tempdb .*auth=sql" "$TMP/access.log" \
+      || fail "route: access log lacks the LOGIN7 fields: $(cat "$TMP/access.log")"
+    echo "  ok: route: access log has LOGIN7 fields"
+  fi
 done
 
 echo "PASS: mssql_server_test"

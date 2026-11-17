@@ -5,18 +5,27 @@
 // its own certificate), toward the SQL Server it is the TLS client. No Envoy
 // dependency: bytes in, bytes out.
 //
-// Both legs end up in the same encryption mode, because the PRELOGIN exchange
-// is forwarded as is, apart from the client-certificate bit, which is cleared
-// (a certificate login can't cross a terminating proxy). Per mode:
-// - None: plain TDS throughout; units are validated and forwarded.
-// - LoginOnly: each leg runs its own TLS handshake inside PRELOGIN packets;
-//   the client's LOGIN7 is decrypted and re-encrypted toward the server; then
-//   both legs go back to plain TDS.
-// - Full: as LoginOnly, but every later message is decrypted and re-encrypted,
-//   whatever its type.
-// Only whole TDS (or MARS SMP) units are forwarded, after validation. A
-// connection that doesn't open with a client PRELOGIN is passed through
-// untouched, as in ConnectionTracker.
+// Two ways to open a connection:
+// - Forwarded PRELOGIN (default): the client's PRELOGIN goes to the server and
+//   the server's answer back to the client, apart from the client-certificate
+//   bit, which is cleared (a certificate login can't cross a terminating
+//   proxy). Both legs end up in the same encryption mode.
+// - Local PRELOGIN (answer_prelogin): the bridge answers the client's PRELOGIN
+//   itself, runs the client's TLS handshake and reads its LOGIN7 before any
+//   byte goes to the server, so the caller can pick the server from LOGIN7.
+//   Only then does it send the client's PRELOGIN upstream (asking for at least
+//   login encryption, even for a client that can't encrypt), check that the
+//   server's answer fits what the client was told, and forward the LOGIN7.
+//   The legs may then differ in encryption mode.
+//
+// Encryption modes, per leg:
+// - None: plain TDS throughout.
+// - LoginOnly: TLS handshake inside PRELOGIN packets; LOGIN7 travels encrypted
+//   from the client side, then the leg is plain TDS.
+// - Full: TLS handshake inside PRELOGIN packets, then only TLS records.
+// Every TDS (or MARS SMP) unit is validated and forwarded whole, re-encoded for
+// the leg it leaves on, whatever its type. A connection that doesn't open with
+// a client PRELOGIN is passed through untouched, as in ConnectionTracker.
 
 #include <openssl/ssl.h>
 
@@ -27,6 +36,7 @@
 #include <string>
 #include <string_view>
 
+#include "login7.h"
 #include "tds.h"
 #include "tds_connection.h"
 
@@ -61,10 +71,17 @@ private:
   std::string server_name_;
 };
 
+struct BridgeOptions {
+  // Answer the client's PRELOGIN locally and hold everything for the server
+  // until the client's LOGIN7 has been read (see above).
+  bool answer_prelogin = false;
+};
+
 struct BridgeError {
   enum class Kind {
-    Protocol, // Malformed TDS or a protocol violation.
-    Tls,      // TLS handshake or record failure on either leg.
+    Protocol,     // Malformed TDS or a protocol violation.
+    Tls,          // TLS handshake or record failure on either leg.
+    Incompatible, // The server's PRELOGIN answer contradicts the local one.
   };
   Kind kind;
   std::string message;
@@ -78,7 +95,7 @@ struct BridgeOutput {
 
 class TlsBridge {
 public:
-  explicit TlsBridge(std::shared_ptr<const TlsContexts> contexts);
+  TlsBridge(std::shared_ptr<const TlsContexts> contexts, BridgeOptions options = {});
   TlsBridge(const TlsBridge&) = delete;
   TlsBridge& operator=(const TlsBridge&) = delete;
 
@@ -94,18 +111,27 @@ public:
 
   // False once the connection turned out not to be a TDS 7.x conversation.
   bool parsing() const { return !passive_; }
-  EncryptionMode encryptionMode() const { return mode_; }
+  // Encryption mode of the client's leg, and of the server's.
+  EncryptionMode encryptionMode() const { return leg_mode_[kClient]; }
+  EncryptionMode serverEncryptionMode() const { return leg_mode_[kServer]; }
   bool marsEnabled() const { return mars_; }
-  // True once the TLS handshakes with both the client and the server are done.
+  // True once every TLS handshake the legs need is done (both legs encrypted).
   bool tlsEstablished() const { return down_.handshake_done && up_.handshake_done; }
   // The client asked for a certificate login, which was turned off.
   bool clientCertCleared() const { return client_cert_cleared_; }
   std::optional<uint32_t> packetSize() const { return packet_size_; }
-  // LOGIN7 messages seen in plain text (decrypted when sent over TLS).
-  uint64_t login7Messages() const { return login7_messages_; }
+  // The client's LOGIN7, once read (decrypted when sent over TLS).
+  const std::optional<Login7>& login() const { return login_; }
+  // True once anything has been sent toward the server. With answer_prelogin
+  // this happens in the call that reads LOGIN7: route before sending it on.
+  bool upstreamStarted() const { return upstream_started_; }
 
 private:
   enum class Stage { Prelogin, Handshake, Tls, Plain };
+
+  // Legs are indexed by the direction of the data they receive.
+  static constexpr size_t kClient = 0; // Direction::ClientToServer
+  static constexpr size_t kServer = 1; // Direction::ServerToClient
 
   // One TLS session, with memory BIOs: rbio holds received TLS bytes, wbio
   // collects TLS bytes to send.
@@ -145,16 +171,22 @@ private:
   std::optional<BridgeError> feed(Direction d, std::string_view data, BridgeOutput& out);
   std::optional<BridgeError> onWireUnit(Direction d, const Unit& unit);
   std::optional<BridgeError> onPreloginUnit(Direction d, const Unit& unit);
-  std::optional<BridgeError> onPreloginMessage(Direction d, std::string& payload);
+  std::optional<BridgeError> onClientPrelogin(std::string& payload);
+  std::optional<BridgeError> onServerPrelogin(const std::string& payload);
+  std::optional<BridgeError> startLeg(Direction from);
+  std::optional<BridgeError> serverReady();
   std::optional<BridgeError> driveHandshake(Direction from);
   std::optional<BridgeError> decrypt(Direction from, std::string_view record);
-  std::optional<BridgeError> onPlainUnit(Direction d, const Unit& unit, bool decrypted);
+  std::optional<BridgeError> onPlainUnit(Direction d, const Unit& unit);
+  std::optional<BridgeError> readLogin7(const Unit& unit);
   std::optional<BridgeError> scanLoginMessage(const Unit& unit);
-  std::optional<BridgeError> sendEncrypted(Direction d, std::string_view plain);
+  std::optional<BridgeError> forward(Direction d, std::string_view bytes);
   std::string drainTls(Leg& leg);
+  void setMars(size_t leg, bool enabled);
   void setMaxPacketSize(size_t size);
 
   std::shared_ptr<const TlsContexts> contexts_;
+  BridgeOptions options_;
   // TLS session with the client (we are the server) and with the SQL Server
   // (we are the client).
   Leg down_;
@@ -165,19 +197,32 @@ private:
   std::array<Sink, 2> wire_sinks_;
   std::array<Sink, 2> plain_sinks_;
   std::array<Stage, 2> stage_{Stage::Prelogin, Stage::Prelogin};
+  std::array<EncryptionMode, 2> leg_mode_{EncryptionMode::Unknown, EncryptionMode::Unknown};
+  // Application data (after PRELOGIN and handshake) sent on each leg, and
+  // plain application data received from it: under login-only these mark
+  // where the leg leaves TLS.
+  std::array<bool, 2> app_sent_{false, false};
+  std::array<bool, 2> plain_received_{false, false};
 
   BridgeOutput* out_ = nullptr;      // Output of the call in progress.
   std::optional<BridgeError> error_; // Error raised inside a sink.
   std::string client_raw_;           // Client bytes until its PRELOGIN, for passthrough.
   std::string prelogin_payload_;     // PRELOGIN message being assembled.
   std::optional<PreloginOptions> client_prelogin_;
-  std::string pending_to_server_; // Plain text waiting for the server handshake.
+  std::string upstream_prelogin_; // The PRELOGIN message for the server.
+  // Its ENCRYPTION option (the client's, raised to Off from NotSupported
+  // under answer_prelogin).
+  PreloginEncryption upstream_encryption_ = PreloginEncryption::Off;
+  bool upstream_started_ = false;
+  bool server_ready_ = false;     // The server's leg can carry application data.
+  std::string pending_to_server_; // Plain text waiting for the server's leg.
 
-  EncryptionMode mode_ = EncryptionMode::Unknown;
   bool mars_ = false;
   bool passive_ = false;
   bool client_cert_cleared_ = false;
-  uint64_t login7_messages_ = 0;
+
+  std::string login7_message_; // LOGIN7 being assembled.
+  std::optional<Login7> login_;
 
   // Scanning the server's login messages for LOGINACK and the packet size.
   bool scanning_login_ = true;
