@@ -18,7 +18,7 @@
 //       ]
 //     },
 //     "auth": {                             // Login policy; needs "tls".
-//       "ntlm": "pass_through",             // Or "deny"; default pass_through.
+//       "ntlm": "pass_through",             // Or "v2_only", "deny"; default pass_through.
 //       "deny": ["sa", "CORP\\svc_old"]     // Identities refused with error 18456.
 //     }
 //   }
@@ -32,9 +32,11 @@
 // route matches goes to tcp_proxy's own cluster.
 //
 // "auth" applies to every TDS 7.x login the module reads (see auth.h): logins
-// it refuses are answered with error 18456 and never reach the server. With
-// "ntlm": "deny", integrated logins whose mechanism isn't recognised are
-// refused too, since they could be NTLM.
+// it refuses are answered with error 18456 and never reach the server. NTLM
+// passes through unchanged and the server verifies it; the module reads the
+// claimed user from AUTHENTICATE ("DOMAIN\\user" in deny entries). "v2_only"
+// refuses NTLMv1 responses. With "ntlm": "deny", integrated logins whose
+// mechanism isn't recognised are refused too, since they could be NTLM.
 //
 // Unknown keys are rejected, so a typo can't silently disable a setting.
 

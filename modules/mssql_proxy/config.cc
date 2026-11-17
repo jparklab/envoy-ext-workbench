@@ -168,8 +168,10 @@ std::optional<AuthSettings> parseAuth(const Json& auth, std::string& error) {
   if (auto ntlm = getString(auth, "ntlm", "auth", error)) {
     if (*ntlm == "deny") {
       settings.ntlm_allowed = false;
+    } else if (*ntlm == "v2_only") {
+      settings.ntlm_v1_allowed = false;
     } else if (*ntlm != "pass_through") {
-      error = "auth.ntlm must be \"pass_through\" or \"deny\"";
+      error = "auth.ntlm must be \"pass_through\", \"v2_only\" or \"deny\"";
       return std::nullopt;
     }
   } else if (!error.empty()) {

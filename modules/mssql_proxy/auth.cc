@@ -4,6 +4,8 @@
 #include <cctype>
 #include <format>
 
+#include "ntlm.h"
+
 namespace MssqlProxy {
 
 namespace {
@@ -85,6 +87,18 @@ std::optional<Denial> LoginAuth::classify(std::string_view token) {
   if (parsed && parsed->mechanism != AuthMechanism::Unknown) {
     method_ = parsed->mechanism == AuthMechanism::Kerberos ? LoginMethod::Kerberos
                                                            : LoginMethod::Ntlm;
+  }
+  if (parsed && parsed->mechanism == AuthMechanism::Ntlm &&
+      ntlmMessageType(parsed->inner) == kNtlmAuthenticate) {
+    std::optional<NtlmAuthenticate> authenticate = parseNtlmAuthenticate(parsed->inner, error);
+    if (!authenticate) {
+      // Fails closed: the server might read the message differently.
+      return Denial{error, loginFailed("")};
+    }
+    identity_ = ntlmIdentity(*authenticate);
+    if (authenticate->v1 && !settings_->ntlm_v1_allowed) {
+      return Denial{std::format("NTLMv1 login of {} refused", identity_), loginFailed(identity_)};
+    }
   }
   return check();
 }

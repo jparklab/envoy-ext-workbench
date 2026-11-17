@@ -321,15 +321,24 @@ The proxy relays the messages unchanged and reads the identity on the way.
   It is the client's claim until LOGINACK, verified after (user and domain are
   inputs to the NTLMv2 response).
 
-- [ ] Bounds-checked AUTHENTICATE parse: every field's offset/length validated;
-      UTF-16LE when NEGOTIATE_UNICODE was negotiated, OEM otherwise
-- [ ] Normalise identity: `DOMAIN\user` vs UPN `user@dns.domain`
-- [ ] Never modify NTLM messages or their SPNEGO wrapper (the MIC covers all
-      three); hold client traffic until the login result is known
-- [ ] `ntlm: deny` refuses NTLM logins early; optional NTLMv1 rejection
-      (NtChallengeResponse length 24)
-- [ ] Unit tests on synthetic messages; integration test with a SQL Server that
-      accepts NTLM (unverified on Linux, see open questions)
+- [x] Bounds-checked AUTHENTICATE parse: every field's offset/length validated;
+      UTF-16LE when NEGOTIATE_UNICODE was negotiated, OEM otherwise (ASCII
+      kept, other bytes U+FFFD: the code page isn't known)
+- [x] Identity as sent: `DOMAIN\user`, or the bare user name when the domain
+      is empty (UPN `user@dns.domain`); the deny list matches it ignoring case
+- [x] Never modify NTLM messages or their SPNEGO wrapper (the MIC covers all
+      three); each client message is held until whole and checked first
+- [x] `ntlm: deny` refuses NTLM logins early; `ntlm: v2_only` refuses NTLMv1
+      (NtChallengeResponse length 24); a malformed AUTHENTICATE is refused
+- [x] Unit tests on MS-NLMP-shaped messages (Unicode, OEM, UPN, v1,
+      anonymous, malformed) and a relayed NEGOTIATE/CHALLENGE/AUTHENTICATE
+      exchange through the bridge, plus a refusal at AUTHENTICATE
+- [ ] Integration test with a SQL Server that accepts NTLM: needs an
+      AD-joined SQL Server (Windows, or Linux joined to AD) and an NTLM client;
+      neither is available here
+
+Not done here: mapping NetBIOS to DNS domain names (or UPNs to
+`DOMAIN\user`) for the deny list; each form must be listed as clients send it.
 
 Deployment: Extended Protection must be *Off* (AUTHENTICATE carries a channel
 binding of the proxy's certificate; *Allowed* already enforces it for clients

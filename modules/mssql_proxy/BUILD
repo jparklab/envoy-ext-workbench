@@ -24,10 +24,12 @@ cc_library(
     srcs = [
         "auth.cc",
         "gss_token.cc",
+        "ntlm.cc",
     ],
     hdrs = [
         "auth.h",
         "gss_token.h",
+        "ntlm.h",
     ],
     deps = [":tds"],
 )

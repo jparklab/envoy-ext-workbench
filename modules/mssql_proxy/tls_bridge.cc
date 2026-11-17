@@ -185,11 +185,12 @@ BridgeError incompatible(std::string message) {
 } // namespace
 
 TlsBridge::TlsBridge(std::shared_ptr<const TlsContexts> contexts, BridgeOptions options)
-    : contexts_(std::move(contexts)), options_(options), auth_(options_.auth),
+    : contexts_(std::move(contexts)), options_(options),
       wire_sinks_{Sink(*this, Direction::ClientToServer, false),
                   Sink(*this, Direction::ServerToClient, false)},
       plain_sinks_{Sink(*this, Direction::ClientToServer, true),
-                   Sink(*this, Direction::ServerToClient, true)} {}
+                   Sink(*this, Direction::ServerToClient, true)},
+      auth_(options_.auth) {}
 
 std::optional<std::string> TlsBridge::Sink::onUnit(const Unit& unit) {
   std::optional<BridgeError> error = decrypted_ ? bridge_.onPlainUnit(direction_, unit)

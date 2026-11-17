@@ -144,6 +144,13 @@ TEST(Config, Auth) {
   config = parseFilterConfig(std::format(R"({{{}, "auth": {{}}}})", kTls), kFiles, error);
   ASSERT_TRUE(config) << error;
   EXPECT_TRUE(config->auth->ntlm_allowed) << "NTLM passes through by default";
+  EXPECT_TRUE(config->auth->ntlm_v1_allowed);
+
+  config = parseFilterConfig(std::format(R"({{{}, "auth": {{"ntlm": "v2_only"}}}})", kTls),
+                             kFiles, error);
+  ASSERT_TRUE(config) << error;
+  EXPECT_TRUE(config->auth->ntlm_allowed);
+  EXPECT_FALSE(config->auth->ntlm_v1_allowed);
 }
 
 TEST(Config, RejectsBadAuth) {

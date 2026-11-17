@@ -90,6 +90,16 @@ inline std::string loginAck() {
   return std::string(1, static_cast<char>(0xad)) + le16(data.size()) + data;
 }
 
+// UTF-16LE of an ASCII string.
+inline std::string utf16(std::string_view ascii) {
+  std::string s;
+  for (char c : ascii) {
+    s.push_back(c);
+    s.push_back(0);
+  }
+  return s;
+}
+
 // DER TLV with a single-byte tag.
 inline std::string der(uint8_t tag, std::string_view value) {
   std::string out(1, static_cast<char>(tag));
@@ -118,11 +128,52 @@ inline std::string krb5Token(uint16_t tok_id = 0x0100, std::string_view message 
   return der(0x60, inner);
 }
 
-// An NTLMSSP message of the given type (1 NEGOTIATE, 3 AUTHENTICATE), body
-// not filled in.
+// An NTLMSSP message of the given type (1 NEGOTIATE, 2 CHALLENGE), body not
+// filled in. For AUTHENTICATE see ntlmAuthenticate.
 inline std::string ntlmMessage(uint8_t type) {
   return std::string("NTLMSSP\0", 8) + std::string{static_cast<char>(type), 0, 0, 0} +
          std::string(16, '\0');
+}
+
+struct NtlmFields {
+  std::string domain = "CORP";
+  std::string user = "alice";
+  std::string workstation = "WS01";
+  bool unicode = true;
+  size_t nt_response_size = 72; // NTLMv2: 16-byte proof plus the blob; v1: 24.
+};
+
+// An AUTHENTICATE message (MS-NLMP 2.2.1.3) with Version and MIC, payload
+// laid out as Windows does: domain, user, workstation, LM, NT, session key.
+// The responses are filler: the proxy never verifies them.
+inline std::string ntlmAuthenticate(const NtlmFields& f = {}) {
+  constexpr size_t kHeader = 88; // Fixed fields, Version (8), MIC (16).
+  std::string head = std::string("NTLMSSP\0", 8) + std::string{3, 0, 0, 0};
+  head.resize(kHeader, '\0');
+  std::string payload;
+  auto field = [&](size_t at, std::string_view bytes) {
+    const size_t offset = kHeader + payload.size();
+    head[at] = static_cast<char>(bytes.size() & 0xff);
+    head[at + 1] = static_cast<char>(bytes.size() >> 8);
+    head[at + 2] = head[at];
+    head[at + 3] = head[at + 1];
+    for (int i = 0; i < 4; ++i) {
+      head[at + 4 + i] = static_cast<char>((offset >> (8 * i)) & 0xff);
+    }
+    payload += bytes;
+  };
+  auto text = [&](std::string_view ascii) { return f.unicode ? utf16(ascii) : std::string(ascii); };
+  field(28, text(f.domain));
+  field(36, text(f.user));
+  field(44, text(f.workstation));
+  field(12, std::string(24, 'L'));
+  field(20, std::string(f.nt_response_size, 'N'));
+  field(52, std::string(16, 'K'));
+  const uint32_t flags = f.unicode ? 0xe2888215u : ((0xe2888215u & ~1u) | 2u); // OEM bit instead.
+  for (int i = 0; i < 4; ++i) {
+    head[60 + i] = static_cast<char>((flags >> (8 * i)) & 0xff);
+  }
+  return head + payload;
 }
 
 // SPNEGO NegTokenInit offering mechs, with an optional mechToken.
@@ -146,15 +197,6 @@ inline std::string spnegoResp(std::string_view response_token) {
 
 inline std::string done() { return std::string(1, static_cast<char>(0xfd)) + std::string(12, '\0'); }
 
-// UTF-16LE of an ASCII string.
-inline std::string utf16(std::string_view ascii) {
-  std::string s;
-  for (char c : ascii) {
-    s.push_back(c);
-    s.push_back(0);
-  }
-  return s;
-}
 
 struct Login7Fields {
   std::string host = "client-host";

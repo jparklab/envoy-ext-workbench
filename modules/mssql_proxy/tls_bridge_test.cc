@@ -647,7 +647,7 @@ TEST(LocalPreloginServer, PassesThroughWhenNotOpeningWithPrelogin) {
 // ---------------------------------------------------------------- login policy
 
 std::shared_ptr<const AuthSettings> policy(bool ntlm_allowed, std::vector<std::string> deny) {
-  return std::make_shared<const AuthSettings>(AuthSettings{ntlm_allowed, std::move(deny)});
+  return std::make_shared<const AuthSettings>(AuthSettings{.ntlm_allowed = ntlm_allowed, .deny = std::move(deny)});
 }
 
 std::string sspiToken(std::string_view data) {
@@ -740,6 +740,61 @@ TEST(Login, SspiMessagesForwardedWhole) {
   EXPECT_EQ(h.server.received, makeTdsMessage(kTdsSspi, next, 512));
 }
 
+// NTLM relayed unchanged: NEGOTIATE in LOGIN7, the server's CHALLENGE, the
+// client's AUTHENTICATE, LOGINACK; the identity is read on the way.
+TEST(Login, NtlmPassThrough) {
+  Harness h(kEncOn, kEncOn, 3, false, contexts(), BridgeOptions{.answer_prelogin = true});
+  h.client.start();
+  ASSERT_TRUE(h.pump()) << h.message();
+  Login7Fields f;
+  f.user = "";
+  f.integrated = true;
+  f.sspi = spnegoInit({kOidNtlm}, ntlmMessage(1));
+  h.client.send(kTdsLogin7, login7Payload(f), true);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(h.bridge.auth().method(), LoginMethod::Ntlm);
+
+  const std::string challenge = sspiToken(der(0xa1, der(0x30, der(0xa2, der(0x04, ntlmMessage(2))))));
+  h.server.send(kTdsTabularResult, challenge + done(), true);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(h.client.received, makeTdsMessage(kTdsTabularResult, challenge + done(), 4096));
+
+  h.server.received.clear();
+  const std::string auth = spnegoResp(ntlmAuthenticate());
+  h.client.send(kTdsSspi, auth, true);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(h.server.received, makeTdsMessage(kTdsSspi, auth, 4096)) << "relayed unchanged";
+  EXPECT_EQ(h.bridge.auth().identity(), "CORP\\alice");
+  EXPECT_EQ(h.bridge.auth().result(), LoginResult::Pending);
+
+  h.server.send(kTdsTabularResult, loginResponse("4096"), true);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(h.bridge.auth().result(), LoginResult::Succeeded);
+}
+
+TEST(Login, NtlmUserRefusedBeforeTheServerSeesAuthenticate) {
+  Harness h(kEncOff, kEncOff, 0, false, contexts(),
+            BridgeOptions{.auth = policy(true, {"CORP\\alice"})});
+  ASSERT_TRUE(h.connect()) << h.message();
+  Login7Fields f;
+  f.user = "";
+  f.integrated = true;
+  f.sspi = ntlmMessage(1);
+  h.client.send(kTdsLogin7, login7Payload(f), true);
+  ASSERT_TRUE(h.pump()) << h.message();
+  h.server.send(kTdsTabularResult, sspiToken(ntlmMessage(2)) + done(), false);
+  ASSERT_TRUE(h.pump()) << h.message();
+
+  h.server.received.clear();
+  h.client.send(kTdsSspi, ntlmAuthenticate(), false);
+  h.pump();
+  ASSERT_TRUE(h.error);
+  EXPECT_EQ(h.error->kind, BridgeError::Kind::Denied);
+  EXPECT_TRUE(h.server.received.empty());
+  EXPECT_NE(h.client.received.find(utf16("Login failed for user 'CORP\\alice'.")),
+            std::string::npos);
+}
+
 TEST(Login, NtlmRefusedWhenTheClientSwitchesToIt) {
   Harness h(kEncOff, kEncOff, 0, false, contexts(), BridgeOptions{.auth = policy(false, {})});
   ASSERT_TRUE(h.connect()) << h.message();
@@ -754,7 +809,7 @@ TEST(Login, NtlmRefusedWhenTheClientSwitchesToIt) {
 
   h.server.received.clear();
   h.client.received.clear();
-  h.client.send(kTdsSspi, spnegoResp(ntlmMessage(3)), false);
+  h.client.send(kTdsSspi, spnegoResp(ntlmAuthenticate()), false);
   h.pump();
   ASSERT_TRUE(h.error);
   EXPECT_EQ(h.error->kind, BridgeError::Kind::Denied);

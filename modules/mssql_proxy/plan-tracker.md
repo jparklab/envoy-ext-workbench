@@ -27,4 +27,5 @@ Progress log against plan.md.
 
 - [x] 2026-11-17: plan revised around three options: Kerberos read_ticket (no shared replay cache), Kerberos terminate with re-authentication (delegate or service account, configurable), NTLM pass-through; split into 5a shared pieces, 5b NTLM, 5c read_ticket, 5d terminate
 - [x] 2026-11-17: 5a: `auth` config (`ntlm`, `deny`); authentication token classifier (SPNEGO, GSS Kerberos, NTLMSSP); LOGIN7 and SSPI messages held and checked before forwarding; refusals answered with ERROR 18456; login method, identity and result in metadata and counters; unit tests, and the server test refuses a login by name in the terminating and routing passes
-- [ ] 5b: NTLM pass-through
+- [x] 2026-11-17: 5b: NTLM AUTHENTICATE parsed for the claimed identity (`DOMAIN\user` or UPN), messages relayed unchanged, `ntlm: v2_only` and deny list applied at AUTHENTICATE before it reaches the server; unit and bridge tests on MS-NLMP-shaped messages; no real NTLM test (needs an AD-joined SQL Server)
+- [ ] 5c: Kerberos read_ticket

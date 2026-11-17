@@ -22,8 +22,11 @@ namespace MssqlProxy {
 struct AuthSettings {
   // NTLM logins pass through (the server verifies them), or are refused.
   bool ntlm_allowed = true;
+  // NTLMv1 responses (24 bytes) pass through, or are refused.
+  bool ntlm_v1_allowed = true;
   // Identities refused before the server is asked, compared ignoring ASCII
-  // case: SQL login names; DOMAIN\user or user@realm for integrated logins.
+  // case: SQL login names; for NTLM "DOMAIN\user" with the domain as the client
+  // sent it (NetBIOS or DNS name), or the bare user name it sent (e.g. a UPN).
   std::vector<std::string> deny;
 };
 

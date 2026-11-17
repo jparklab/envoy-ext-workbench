@@ -3,6 +3,7 @@
 #include <string>
 
 #include "gss_token.h"
+#include "ntlm.h"
 #include "gtest/gtest.h"
 #include "test_util.h"
 
@@ -70,12 +71,12 @@ TEST(AuthToken, SpnegoInitWithoutTokenTakesFirstOffer) {
 }
 
 TEST(AuthToken, SpnegoRespWithNtlmAuthenticate) {
-  const std::string token = spnegoResp(ntlmMessage(3));
+  const std::string token = spnegoResp(ntlmAuthenticate());
   auto t = parse(token);
   ASSERT_TRUE(t);
   EXPECT_TRUE(t->spnego);
   EXPECT_EQ(t->mechanism, AuthMechanism::Ntlm);
-  EXPECT_EQ(t->inner, ntlmMessage(3));
+  EXPECT_EQ(t->inner, ntlmAuthenticate());
 }
 
 TEST(AuthToken, RejectsMalformed) {
@@ -99,6 +100,75 @@ TEST(AuthToken, RejectsMalformed) {
   }
 }
 
+// ---------------------------------------------------------------- NTLM
+
+std::optional<NtlmAuthenticate> authenticate(const std::string& message) {
+  std::string error;
+  auto a = parseNtlmAuthenticate(message, error);
+  EXPECT_TRUE(a) << error;
+  return a;
+}
+
+TEST(Ntlm, MessageType) {
+  EXPECT_EQ(ntlmMessageType(ntlmMessage(1)), kNtlmNegotiate);
+  EXPECT_EQ(ntlmMessageType(ntlmAuthenticate()), kNtlmAuthenticate);
+  EXPECT_EQ(ntlmMessageType("NTLMSSP"), std::nullopt);
+  EXPECT_EQ(ntlmMessageType(krb5Token()), std::nullopt);
+}
+
+TEST(Ntlm, ReadsUnicodeAuthenticate) {
+  auto a = authenticate(ntlmAuthenticate());
+  ASSERT_TRUE(a);
+  EXPECT_TRUE(a->unicode);
+  EXPECT_EQ(a->domain, "CORP");
+  EXPECT_EQ(a->user, "alice");
+  EXPECT_EQ(a->workstation, "WS01");
+  EXPECT_FALSE(a->v1);
+  EXPECT_FALSE(a->anonymous);
+  EXPECT_EQ(ntlmIdentity(*a), "CORP\\alice");
+}
+
+TEST(Ntlm, ReadsOemAuthenticate) {
+  NtlmFields f;
+  f.unicode = false;
+  f.user = "b\xe9" "b"; // Not ASCII: the OEM code page is unknown.
+  auto a = authenticate(ntlmAuthenticate(f));
+  ASSERT_TRUE(a);
+  EXPECT_FALSE(a->unicode);
+  EXPECT_EQ(a->user, "b\xef\xbf\xbd" "b");
+}
+
+TEST(Ntlm, UpnV1AndAnonymous) {
+  NtlmFields f;
+  f.domain = "";
+  f.user = "alice@corp.example";
+  f.nt_response_size = 24;
+  auto a = authenticate(ntlmAuthenticate(f));
+  ASSERT_TRUE(a);
+  EXPECT_EQ(ntlmIdentity(*a), "alice@corp.example");
+  EXPECT_TRUE(a->v1);
+
+  f.user = "";
+  f.nt_response_size = 0;
+  a = authenticate(ntlmAuthenticate(f));
+  ASSERT_TRUE(a);
+  EXPECT_TRUE(a->anonymous);
+}
+
+TEST(Ntlm, RejectsMalformedAuthenticate) {
+  const std::string good = ntlmAuthenticate();
+  std::string user_past_end = good;
+  user_past_end[40] = static_cast<char>(0xf0); // UserName offset far out.
+  std::string odd_length = good;
+  odd_length[36] = 9; // UserName of 9 bytes in UTF-16.
+  const std::string cases[] = {good.substr(0, 63), user_past_end, odd_length, ntlmMessage(1)};
+  for (const std::string& message : cases) {
+    std::string error;
+    EXPECT_FALSE(parseNtlmAuthenticate(message, error));
+    EXPECT_FALSE(error.empty());
+  }
+}
+
 // ---------------------------------------------------------------- login
 
 Login7 sqlLogin(std::string user) {
@@ -116,7 +186,7 @@ Login7 integratedLogin(std::string sspi) {
 }
 
 std::shared_ptr<const AuthSettings> settings(bool ntlm_allowed, std::vector<std::string> deny) {
-  return std::make_shared<const AuthSettings>(AuthSettings{ntlm_allowed, std::move(deny)});
+  return std::make_shared<const AuthSettings>(AuthSettings{.ntlm_allowed = ntlm_allowed, .deny = std::move(deny)});
 }
 
 TEST(LoginAuth, SqlLoginAndResult) {
@@ -193,14 +263,53 @@ TEST(LoginAuth, NtlmDeniedAfterKerberosFallsBack) {
   LoginAuth auth(settings(false, {}));
   EXPECT_FALSE(auth.onLogin7(integratedLogin(spnegoInit({kOidKrb5, kOidNtlm}, krb5Token()))));
   EXPECT_EQ(auth.method(), LoginMethod::Kerberos);
-  EXPECT_TRUE(auth.onClientSspi(spnegoResp(ntlmMessage(3))));
+  EXPECT_TRUE(auth.onClientSspi(spnegoResp(ntlmAuthenticate())));
   EXPECT_EQ(auth.method(), LoginMethod::Ntlm);
+}
+
+std::shared_ptr<const AuthSettings> v2Only() {
+  AuthSettings s;
+  s.ntlm_v1_allowed = false;
+  return std::make_shared<const AuthSettings>(s);
+}
+
+TEST(LoginAuth, NtlmIdentityFromAuthenticate) {
+  LoginAuth auth(nullptr);
+  EXPECT_FALSE(auth.onLogin7(integratedLogin(spnegoInit({kOidNtlm}, ntlmMessage(1)))));
+  EXPECT_EQ(auth.identity(), "") << "unknown until AUTHENTICATE";
+  EXPECT_FALSE(auth.onClientSspi(spnegoResp(ntlmAuthenticate())));
+  EXPECT_EQ(auth.method(), LoginMethod::Ntlm);
+  EXPECT_EQ(auth.identity(), "CORP\\alice");
+}
+
+TEST(LoginAuth, NtlmDenyListAndV1) {
+  LoginAuth listed(settings(true, {"corp\\ALICE"}));
+  listed.onLogin7(integratedLogin(ntlmMessage(1)));
+  auto denial = listed.onClientSspi(ntlmAuthenticate());
+  ASSERT_TRUE(denial);
+  EXPECT_EQ(denial->client_text, "Login failed for user 'CORP\\alice'.");
+
+  NtlmFields v1;
+  v1.nt_response_size = 24;
+  LoginAuth strict(v2Only());
+  strict.onLogin7(integratedLogin(ntlmMessage(1)));
+  EXPECT_TRUE(strict.onClientSspi(ntlmAuthenticate(v1)));
+
+  LoginAuth v2(v2Only());
+  v2.onLogin7(integratedLogin(ntlmMessage(1)));
+  EXPECT_FALSE(v2.onClientSspi(ntlmAuthenticate()));
+}
+
+TEST(LoginAuth, MalformedNtlmAuthenticateRefused) {
+  LoginAuth auth(nullptr);
+  auth.onLogin7(integratedLogin(ntlmMessage(1)));
+  EXPECT_TRUE(auth.onClientSspi(ntlmAuthenticate().substr(0, 70)));
 }
 
 TEST(LoginAuth, SqlLoginIgnoresSspiPackets) {
   LoginAuth auth(settings(false, {}));
   EXPECT_FALSE(auth.onLogin7(sqlLogin("app_user")));
-  EXPECT_FALSE(auth.onClientSspi(ntlmMessage(3)));
+  EXPECT_FALSE(auth.onClientSspi(ntlmAuthenticate()));
   EXPECT_EQ(auth.method(), LoginMethod::Sql);
 }
 
