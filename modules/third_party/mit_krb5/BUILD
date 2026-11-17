@@ -34,6 +34,13 @@ configure_make(
         "--without-libedit",
         "--without-readline",
         "--without-system-verto",
+        # Configuration comes from /etc/krb5.conf (or KRB5_CONFIG) only. The
+        # sysconfdir paths (a second krb5.conf, the GSS mechanism list) point
+        # nowhere rather than into the build sandbox or the host's /etc: GSS
+        # mechanism plugins configured there (e.g. gssproxy) are built against
+        # the system's libraries and can't bind to this private copy.
+        "--sysconfdir=/nonexistent/mit_krb5",
+        "--localstatedir=/nonexistent/mit_krb5",
     ],
     copts = [
         "-fPIC",
