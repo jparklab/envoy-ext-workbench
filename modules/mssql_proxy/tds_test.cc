@@ -7,66 +7,12 @@
 #include "gtest/gtest.h"
 #include "tds.h"
 #include "tds_connection.h"
+#include "test_util.h"
 
 namespace MssqlProxy {
 namespace {
 
-// ---------------------------------------------------------------- helpers
-
-std::string tdsPacket(uint8_t type, bool eom, std::string_view payload) {
-  const size_t len = kTdsHeaderSize + payload.size();
-  std::string p;
-  p.push_back(static_cast<char>(type));
-  p.push_back(static_cast<char>(eom ? kTdsStatusEom : 0));
-  p.push_back(static_cast<char>(len >> 8));
-  p.push_back(static_cast<char>(len & 0xff));
-  p.append({0, 0, 1, 0}); // SPID, packet id, window.
-  p.append(payload);
-  return p;
-}
-
-std::string tlsRecord(uint8_t content_type, std::string_view payload) {
-  std::string r;
-  r.push_back(static_cast<char>(content_type));
-  r.append({0x03, 0x03});
-  r.push_back(static_cast<char>(payload.size() >> 8));
-  r.push_back(static_cast<char>(payload.size() & 0xff));
-  r.append(payload);
-  return r;
-}
-
-// PRELOGIN payload with VERSION, ENCRYPTION and (optionally) MARS options.
-std::string preloginPayload(uint8_t encryption, std::optional<uint8_t> mars = std::nullopt) {
-  const size_t options = mars ? 3 : 2;
-  const size_t table = options * 5 + 1;
-  std::string t, data;
-  auto add = [&](uint8_t token, std::string_view value) {
-    const size_t offset = table + data.size();
-    t.push_back(static_cast<char>(token));
-    t.push_back(static_cast<char>(offset >> 8));
-    t.push_back(static_cast<char>(offset & 0xff));
-    t.push_back(0);
-    t.push_back(static_cast<char>(value.size()));
-    data.append(value);
-  };
-  add(0x00, std::string("\x10\x00\x00\x00\x00\x00", 6)); // VERSION
-  add(0x01, std::string(1, static_cast<char>(encryption)));
-  if (mars) {
-    add(0x04, std::string(1, static_cast<char>(*mars)));
-  }
-  t.push_back(static_cast<char>(0xff));
-  return t + data;
-}
-
-struct Collect : UnitSink {
-  std::vector<Unit> units;
-  std::vector<std::string> bytes; // Copies: Unit views die after the callback.
-  std::optional<std::string> onUnit(const Unit& u) override {
-    units.push_back(u);
-    bytes.emplace_back(u.bytes);
-    return std::nullopt;
-  }
-};
+using namespace test;
 
 // ---------------------------------------------------------------- splitter
 
@@ -198,32 +144,37 @@ TEST(Prelogin, RejectsMalformed) {
   EXPECT_FALSE(parsePrelogin(preloginPayload(0x05), error)) << "unknown value";
 }
 
-// ---------------------------------------------------------------- login response
-
-std::string le16(size_t v) {
-  return std::string{static_cast<char>(v & 0xff), static_cast<char>((v >> 8) & 0xff)};
+TEST(Prelogin, ReportsClientCertBitAndEncryptionOffset) {
+  const std::string payload = preloginPayload(0x81);
+  std::string error;
+  auto options = parsePrelogin(payload, error);
+  ASSERT_TRUE(options) << error;
+  EXPECT_EQ(options->encryption, PreloginEncryption::On);
+  EXPECT_TRUE(options->client_cert);
+  ASSERT_TRUE(options->encryption_offset);
+  EXPECT_EQ(static_cast<uint8_t>(payload[*options->encryption_offset]), 0x81);
 }
 
-std::string bVarchar(std::string_view ascii) {
-  std::string s(1, static_cast<char>(ascii.size()));
-  for (char c : ascii) {
-    s.push_back(c);
-    s.push_back(0);
+TEST(MakeTdsMessage, SplitsIntoPackets) {
+  const std::string payload(10, 'p');
+  const std::string message = makeTdsMessage(kTdsPrelogin, payload, kTdsHeaderSize + 4);
+  StreamSplitter s;
+  Collect c;
+  ASSERT_FALSE(s.feed(message, c));
+  ASSERT_EQ(c.units.size(), 3u);
+  std::string joined;
+  for (size_t i = 0; i < c.bytes.size(); ++i) {
+    EXPECT_EQ(static_cast<uint8_t>(c.bytes[i][0]), kTdsPrelogin);
+    EXPECT_EQ(c.bytes[i][1] == kTdsStatusEom, i == 2) << "EOM on the last packet only";
+    EXPECT_EQ(static_cast<uint8_t>(c.bytes[i][6]), i + 1) << "packet ID";
+    joined += c.bytes[i].substr(kTdsHeaderSize);
   }
-  return s;
+  EXPECT_EQ(joined, payload);
+  EXPECT_EQ(makeTdsMessage(kTdsSqlBatch, "", 4096), tdsPacket(kTdsSqlBatch, true, ""))
+      << "an empty payload is one empty packet";
 }
 
-std::string envChangePacketSize(std::string_view new_value, std::string_view old_value) {
-  const std::string data = std::string(1, 4) + bVarchar(new_value) + bVarchar(old_value);
-  return std::string(1, static_cast<char>(0xe3)) + le16(data.size()) + data;
-}
-
-std::string loginAck() {
-  const std::string data(10, 'x');
-  return std::string(1, static_cast<char>(0xad)) + le16(data.size()) + data;
-}
-
-std::string done() { return std::string(1, static_cast<char>(0xfd)) + std::string(12, '\0'); }
+// ---------------------------------------------------------------- login response
 
 TEST(LoginResponse, FindsPacketSizeAndLoginAck) {
   std::string error;

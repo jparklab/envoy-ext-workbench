@@ -142,14 +142,41 @@ Kerberos and NTLM need a domain controller; they are tested in Phase 5.
 
 ## Phase 3: PRELOGIN and TLS
 
-- [ ] `filter_config` (JSON in a `StringValue`): TLS certificate and key paths
-      now; routing rules (Phase 4) and keytab path and policy (Phase 5) added as
-      those phases land. Secrets come from files: the SDK's secret subscription
-      appears to be HTTP-filter only. JSON parser: one Envoy already carries
-      (check which, e.g. nlohmann_json)
-- [ ] PRELOGIN option parse/rewrite (ENCRYPTION)
-- [ ] TLS termination toward the client and origination toward the server, inside TDS PRELOGIN packets
-- [ ] Re-encrypt all packet types
+- [x] `filter_config` (JSON, as a `google.protobuf.Struct` or a `StringValue`;
+      parsed with Envoy's `@nlohmann_json`, unknown keys rejected): `tls`
+      with `cert_file`, `key_file`, `upstream_ca_file`, `upstream_server_name`,
+      `upstream_verify` (`config.h`). Without `tls` the module stays observe-only
+      (Phase 2 tracker). Routing rules (Phase 4) and keytab path and policy
+      (Phase 5) are added as those phases land. Secrets come from files: the
+      SDK's secret subscription appears to be HTTP-filter only
+- [x] PRELOGIN option parse/rewrite (ENCRYPTION): forwarded as is so both legs
+      negotiate the same mode, except the client-certificate bit (0x80), which is
+      cleared: a certificate login authenticates in the TLS handshake, which now
+      ends at the proxy (`mssql_proxy_client_cert_cleared_total`)
+- [x] TLS termination toward the client and origination toward the server, inside
+      TDS PRELOGIN packets (`TlsBridge`, BoringSSL with memory BIOs). Both
+      handshakes run at once; client data waits for the server's to finish.
+      TLS 1.2 only (TDS 7.x clients use 1.2 there), no resumption. Upstream
+      verification on by default; every certificate in `upstream_ca_file` is a
+      trust anchor, so a server's own self-signed certificate can be pinned
+      (typical SQL Server certificates lack keyCertSign and don't verify as their
+      own issuer under BoringSSL)
+- [x] Re-encrypt all packet types: decrypted streams are split into TDS/SMP units
+      (validated, packet size enforced, login response scanned) and re-encrypted
+      whatever their type; login-only goes back to plain TDS on both legs after
+      LOGIN7
+- [x] Tests: unit tests run a simulated client and server with real TLS through
+      the bridge (login-only, full, none, MARS, LOGIN7 held for the server's
+      handshake, client-cert bit, untrusted certificate, name check, malformed
+      data, chunk sizes 1..1000); `tests/mssql_server_test.sh` runs every client
+      mode observe-only and then terminating, checking TLS was terminated and
+      LOGIN7 read on every TDS 7.x connection
+
+Not done here, left for later:
+- Certificate reload without an Envoy restart (files are read at config load).
+- Client certificate authentication through the proxy (the bit is cleared).
+- The module only works when it sees the client's PRELOGIN; it still answers
+  nothing itself (A2 is Phase 4).
 
 ## Phase 4: LOGIN7 routing (A2)
 
@@ -278,11 +305,11 @@ machine account.
 
 ## Open questions
 
-- TLS library for in-module TLS: `@boringssl//:ssl` linked statically into the
-  `.so` is the default choice. Checked on the v1.40.2 build: the Envoy binary
-  exports no BoringSSL symbols (only module callbacks, Lua and malloc), and modules
-  load with `RTLD_LOCAL`, so the module's copy is independent of Envoy's. Still
-  open: a module transport socket instead, later.
+- TLS library for in-module TLS: settled on `@boringssl//:ssl` linked statically
+  into the `.so` (Phase 3). The Envoy binary exports no BoringSSL symbols (only
+  module callbacks, Lua and malloc), and modules load with `RTLD_LOCAL`, so the
+  module's copy is independent of Envoy's. Still open: a module transport socket
+  instead, later.
 - Can `startUpstreamSecureTransport` (in the v1.40.2 C++ SDK) replace in-module TLS
   toward the server? TDS wraps the TLS handshake inside PRELOGIN packets, so likely
   not for TDS 7.x, but it may work for TDS 8.0 (strict encryption, TLS first).

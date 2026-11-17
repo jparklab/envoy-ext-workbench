@@ -1,5 +1,6 @@
 #include "tds.h"
 
+#include <algorithm>
 #include <format>
 
 namespace MssqlProxy {
@@ -165,6 +166,8 @@ std::optional<PreloginOptions> parsePrelogin(std::string_view payload, std::stri
         return std::nullopt;
       }
       const uint8_t v = static_cast<uint8_t>(value[0]) & 0x7f; // Drop the client-cert bit.
+      options.client_cert = (static_cast<uint8_t>(value[0]) & 0x80) != 0;
+      options.encryption_offset = offset;
       if (v > static_cast<uint8_t>(PreloginEncryption::Required)) {
         error = std::format("PRELOGIN ENCRYPTION value 0x{:02x}", v);
         return std::nullopt;
@@ -176,6 +179,32 @@ std::optional<PreloginOptions> parsePrelogin(std::string_view payload, std::stri
     pos += 5;
   }
   return options;
+}
+
+std::string makeTdsMessage(uint8_t type, std::string_view payload, size_t max_packet) {
+  const size_t chunk = max_packet - kTdsHeaderSize;
+  std::string out;
+  uint8_t packet_id = 1;
+  size_t pos = 0;
+  do {
+    const size_t n = std::min(chunk, payload.size() - pos);
+    const size_t len = kTdsHeaderSize + n;
+    const bool last = pos + n == payload.size();
+    const char header[kTdsHeaderSize] = {
+        static_cast<char>(type),
+        static_cast<char>(last ? kTdsStatusEom : 0),
+        static_cast<char>(len >> 8),
+        static_cast<char>(len & 0xff),
+        0, // SPID
+        0,
+        static_cast<char>(packet_id++),
+        0, // Window
+    };
+    out.append(header, kTdsHeaderSize);
+    out.append(payload.substr(pos, n));
+    pos += n;
+  } while (pos < payload.size());
+  return out;
 }
 
 namespace {

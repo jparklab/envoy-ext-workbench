@@ -14,16 +14,49 @@ cc_library(
     ],
 )
 
+# TLS termination on both legs of a TDS 7.x connection; no Envoy dependency.
+cc_library(
+    name = "tls_bridge",
+    srcs = ["tls_bridge.cc"],
+    hdrs = ["tls_bridge.h"],
+    deps = [
+        ":tds",
+        "@boringssl//:ssl",
+    ],
+)
+
+# filter_config parsing; no Envoy dependency.
+cc_library(
+    name = "config",
+    srcs = ["config.cc"],
+    hdrs = ["config.h"],
+    deps = [
+        ":tls_bridge",
+        "@nlohmann_json//:json",
+    ],
+)
+
 envoy_dynamic_module(
     name = "mssql_proxy",
     srcs = ["mssql_proxy.cc"],
-    deps = [":tds"],
+    deps = [
+        ":config",
+        ":tds",
+        ":tls_bridge",
+    ],
 )
 
 # Recorded from a real SQL Server by testdata/record.sh.
 filegroup(
     name = "fixtures",
     srcs = glob(["testdata/*.tds"]),
+)
+
+cc_library(
+    name = "test_util",
+    testonly = True,
+    hdrs = ["test_util.h"],
+    deps = [":tds"],
 )
 
 cc_test(
@@ -33,6 +66,26 @@ cc_test(
     env = {"FIXTURES": "$(rlocationpaths :fixtures)"},
     deps = [
         ":tds",
+        ":test_util",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "tls_bridge_test",
+    srcs = ["tls_bridge_test.cc"],
+    deps = [
+        ":test_util",
+        ":tls_bridge",
+        "@googletest//:gtest_main",
+    ],
+)
+
+cc_test(
+    name = "config_test",
+    srcs = ["config_test.cc"],
+    deps = [
+        ":config",
         "@googletest//:gtest_main",
     ],
 )

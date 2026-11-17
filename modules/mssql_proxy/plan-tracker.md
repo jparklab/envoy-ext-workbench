@@ -17,4 +17,8 @@ Progress log against plan.md.
 
 ## Phase 3: PRELOGIN and TLS
 
+- [x] 2026-11-17: `filter_config` (`tls` settings from files), TLS termination on both legs inside PRELOGIN packets with re-encryption of every type, client-cert bit cleared; observe-only kept when `tls` is absent; unit tests with simulated TLS peers; server test passes all five client modes observe-only and terminating (TLS terminated and LOGIN7 read on every TDS 7.x connection); Phase 3 complete
+
+## Phase 4: LOGIN7 routing (A2)
+
 - [ ] Next up

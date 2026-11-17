@@ -18,10 +18,15 @@
 #
 # Skips (exit 0) when Docker or the mssql-tools sqlcmd binaries are missing.
 # Needs: scripts/build-envoy.sh and scripts/build-modules.sh already run,
-# openssl, python3 with PyYAML. Override the image with MSSQL_IMAGE.
+# openssl, python3 with PyYAML. Override the image with MSSQL_IMAGE; set
+# MSSQL_MODULE_LOG_LEVEL=debug to log why the module closes connections.
 #
-# Set MSSQL_TAP_DIR=<dir> to also record each module-chain connection with
-# Envoy's tap transport socket, as <dir>/<mode>.json (see
+# Runs twice: with the module observing only, then with it terminating TLS on
+# both legs (a throwaway proxy certificate toward the clients, verifying the
+# server's certificate upstream).
+#
+# Set MSSQL_TAP_DIR=<dir> to also record each module-chain connection of the
+# observe pass with Envoy's tap transport socket, as <dir>/<mode>.json (see
 # modules/mssql_proxy/testdata/record.sh).
 set -euo pipefail
 
@@ -47,7 +52,12 @@ trap cleanup EXIT
 
 fail() {
   echo "FAIL: mssql_server_test: $*" >&2
-  echo "--- envoy log" >&2; tail -50 "$TMP/envoy.log" >&2 2>/dev/null || true
+  echo "--- module counters" >&2
+  curl -s http://127.0.0.1:9901/stats 2>/dev/null | grep mssql_proxy_ >&2 || true
+  # Envoy flushes its log file on exit.
+  [[ -n "$envoy_pid" ]] && { kill "$envoy_pid" 2>/dev/null || true; wait "$envoy_pid" 2>/dev/null || true; envoy_pid=""; }
+  echo "--- envoy log" >&2
+  grep -v "statically linked\|server.cc:467" "$TMP/envoy.log" 2>/dev/null | tail -40 >&2 || true
   echo "--- sql server log" >&2; docker logs "$NAME" 2>&1 | tail -20 >&2 || true
   exit 1
 }
@@ -84,24 +94,40 @@ for _ in $(seq 120); do
 done
 [[ -n "$ready" ]] || fail "SQL Server did not become ready"
 
-# Copy the config with the container's port, and with the tap on the module
+# Writes the Envoy config for one pass (observe|terminate): the container's
+# port, the module's TLS settings when terminating, and the tap on the module
 # chain when recording.
 TAP_TMP=""
 if [[ -n "${MSSQL_TAP_DIR:-}" ]]; then
   mkdir -p "$MSSQL_TAP_DIR" "$TMP/tap"
   TAP_TMP="$TMP/tap"
 fi
-python3 -I - "$REPO_ROOT/configs/mssql_proxy.yaml" "$TMP/envoy.yaml" "$port" "$TAP_TMP" <<'EOF' \
-  || fail "could not write the Envoy config"
+write_config() {
+  local pass="$1" tap="" tls=""
+  [[ "$pass" == observe ]] && tap="$TAP_TMP"
+  [[ "$pass" == terminate ]] && tls="$TMP"
+  python3 -I - "$REPO_ROOT/configs/mssql_proxy.yaml" "$TMP/envoy.yaml" "$port" "$tap" "$tls" <<'EOF' \
+    || fail "could not write the Envoy config"
 import sys, yaml
-src, dst, port, tap_dir = sys.argv[1:]
+src, dst, port, tap_dir, tls_dir = sys.argv[1:]
 cfg = yaml.safe_load(open(src))
 res = cfg["static_resources"]
 ep = res["clusters"][0]["load_assignment"]["endpoints"][0]["lb_endpoints"][0]["endpoint"]
 ep["address"]["socket_address"]["port_value"] = int(port)
+chain = next(c for c in res["listeners"][0]["filter_chains"]
+             if c["filter_chain_match"]["transport_protocol"] == "raw_buffer")
+if tls_dir:
+    module = next(f for f in chain["filters"] if f["name"] == "mssql_proxy")
+    module["typed_config"]["filter_config"] = {
+        "@type": "type.googleapis.com/google.protobuf.Struct",
+        "value": {"tls": {
+            "cert_file": tls_dir + "/proxy.pem",
+            "key_file": tls_dir + "/proxy.key",
+            "upstream_ca_file": tls_dir + "/mssql.pem",
+            "upstream_server_name": "127.0.0.1",
+        }},
+    }
 if tap_dir:
-    chain = next(c for c in res["listeners"][0]["filter_chains"]
-                 if c["filter_chain_match"]["transport_protocol"] == "raw_buffer")
     chain["transport_socket"] = {
         "name": "envoy.transport_sockets.tap",
         "typed_config": {
@@ -123,16 +149,29 @@ if tap_dir:
     }
 yaml.safe_dump(cfg, open(dst, "w"), sort_keys=False)
 EOF
-"$REPO_ROOT/scripts/run.sh" "$TMP/envoy.yaml" --log-path "$TMP/envoy.log" &
-envoy_pid=$!
-for _ in $(seq 50); do
-  curl -sf http://127.0.0.1:9901/ready >/dev/null 2>&1 && break
-  kill -0 "$envoy_pid" 2>/dev/null || fail "Envoy exited during startup"
-  sleep 0.2
-done
+}
+
+start_envoy() {
+  write_config "$1"
+  "$REPO_ROOT/scripts/run.sh" "$TMP/envoy.yaml" --log-path "$TMP/envoy.log" \
+    --component-log-level "dynamic_modules:${MSSQL_MODULE_LOG_LEVEL:-info}" &
+  envoy_pid=$!
+  for _ in $(seq 50); do
+    curl -sf http://127.0.0.1:9901/ready >/dev/null 2>&1 && return
+    kill -0 "$envoy_pid" 2>/dev/null || fail "Envoy exited during startup"
+    sleep 0.2
+  done
+  fail "Envoy did not become ready"
+}
+stop_envoy() {
+  kill "$envoy_pid" 2>/dev/null || true
+  wait "$envoy_pid" 2>/dev/null || true
+  envoy_pid=""
+}
 
 stat() { curl -s http://127.0.0.1:9901/stats | sed -n "s/^$1: //p"; }
-module_cx() { stat "dynamicmodulescustom.mssql_proxy_connections_total" | grep . || echo 0; }
+module_stat() { stat "dynamicmodulescustom.mssql_proxy_$1" | grep . || echo 0; }
+module_cx() { module_stat connections_total; }
 strict_cx() { stat "tcp.mssql_strict.downstream_cx_total" | grep . || echo 0; }
 
 QUERY="SET NOCOUNT ON; SELECT encrypt_option, net_transport FROM sys.dm_exec_connections WHERE session_id = @@SPID"
@@ -167,44 +206,62 @@ run_mode() {
   shift 4
   local m0 s0 out
   m0="$(module_cx)"; s0="$(strict_cx)"
-  out="$("$@" 2>&1)" || fail "$label: client failed: $out"
-  grep -Eq "$want" <<<"$out" || fail "$label: expected output matching '$want', got: $out"
+  out="$("$@" 2>&1)" || fail "$pass: $label: client failed: $out"
+  grep -Eq "$want" <<<"$out" || fail "$pass: $label: expected output matching '$want', got: $out"
   local dm=$(( $(module_cx) - m0 )) ds=$(( $(strict_cx) - s0 ))
   case "$want_chain" in
-    module) [[ $dm -eq 1 && $ds -eq 0 ]] || fail "$label: expected module chain (module +$dm, strict +$ds)" ;;
-    strict) [[ $dm -eq 0 && $ds -eq 1 ]] || fail "$label: expected strict chain (module +$dm, strict +$ds)" ;;
+    module) [[ $dm -eq 1 && $ds -eq 0 ]] || fail "$pass: $label: expected module chain (module +$dm, strict +$ds)" ;;
+    strict) [[ $dm -eq 0 && $ds -eq 1 ]] || fail "$pass: $label: expected strict chain (module +$dm, strict +$ds)" ;;
   esac
-  [[ -n "$TAP_TMP" && "$want_chain" == module ]] && save_tap "$name"
-  echo "  ok: $label"
+  [[ -n "$TAP_TMP" && "$pass" == observe && "$want_chain" == module ]] && save_tap "$name"
+  echo "  ok: $pass: $label"
 }
 
-run_mode odbc17_login_only "ODBC 17, login-only TLS" '^FALSE +TCP' module \
-  sqlcmd_query "$SQLCMD17" -S tcp:127.0.0.1,11433 -U sa
-run_mode odbc18_mandatory "ODBC 18, mandatory TLS" '^TRUE +TCP' module \
-  sqlcmd_query "$SQLCMD18" -S tcp:127.0.0.1,11433 -U sa -N -C
-run_mode odbc18_strict "ODBC 18, TDS 8.0 strict" '^TRUE +TCP' strict \
-  sqlcmd_query env SSL_CERT_FILE="$TMP/mssql.pem" "$SQLCMD18" -S tcp:127.0.0.1,11433 -U sa -N s
+# The client-facing certificate for the terminating pass (throwaway). The
+# clients below either don't verify it (login-only) or trust it (-C).
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj "/CN=127.0.0.1" \
+  -addext "subjectAltName=DNS:127.0.0.1,IP:127.0.0.1" \
+  -keyout "$TMP/proxy.key" -out "$TMP/proxy.pem" 2>/dev/null
 
-run_mode odbc17_small_packets "ODBC 17, 512-byte packets, login-only TLS" '^FALSE +512' module \
-  sqlcmd_small_packets "$SQLCMD17" -S tcp:127.0.0.1,11433 -U sa
+# Each pass runs every client: "observe" with the module only following the
+# connection, "terminate" with it terminating TLS on both legs.
+for pass in observe terminate; do
+  start_envoy "$pass"
 
-# MARS over login-only TLS, so the module sees the SMP packets after login.
-# sqlcmd can't enable MARS; unixODBC's isql can, through a connection string.
-login_only=2 mars=0
-if command -v isql >/dev/null; then
-  run_mode odbc17_mars "ODBC 17, MARS, login-only TLS" 'FALSE +\| +Session' module \
-    isql_query "Driver={ODBC Driver 17 for SQL Server};Server=tcp:127.0.0.1,11433;UID=sa;PWD=$SQLCMDPASSWORD;Encrypt=no;MARS_Connection=yes"
-  login_only=3 mars=1
-else
-  echo "  skip: MARS (isql from unixODBC not installed)"
-fi
+  run_mode odbc17_login_only "ODBC 17, login-only TLS" '^FALSE +TCP' module \
+    sqlcmd_query "$SQLCMD17" -S tcp:127.0.0.1,11433 -U sa
+  run_mode odbc18_mandatory "ODBC 18, mandatory TLS" '^TRUE +TCP' module \
+    sqlcmd_query "$SQLCMD18" -S tcp:127.0.0.1,11433 -U sa -N -C
+  run_mode odbc18_strict "ODBC 18, TDS 8.0 strict" '^TRUE +TCP' strict \
+    sqlcmd_query env SSL_CERT_FILE="$TMP/mssql.pem" "$SQLCMD18" -S tcp:127.0.0.1,11433 -U sa -N s
+  run_mode odbc17_small_packets "ODBC 17, 512-byte packets, login-only TLS" '^FALSE +512' module \
+    sqlcmd_small_packets "$SQLCMD17" -S tcp:127.0.0.1,11433 -U sa
 
-# The module followed every TDS 7.x connection's encryption and found no errors.
-module_stat() { stat "dynamicmodulescustom.mssql_proxy_$1" | grep . || echo 0; }
-[[ "$(module_stat encryption_login_only_total)" == "$login_only" ]] || fail "login-only connections not recognised"
-[[ "$(module_stat encryption_full_total)" == 1 ]] || fail "full-encryption connection not recognised"
-[[ "$(module_stat mars_connections_total)" == "$mars" ]] || fail "MARS connection not recognised"
-[[ "$(module_stat protocol_errors_total)" == 0 ]] || fail "protocol errors on real clients"
-[[ "$(module_stat unparsed_connections_total)" == 0 ]] || fail "real clients left unparsed"
+  # MARS over login-only TLS, so the module sees the SMP packets after login.
+  # sqlcmd can't enable MARS; unixODBC's isql can, through a connection string.
+  login_only=2 mars=0
+  if command -v isql >/dev/null; then
+    run_mode odbc17_mars "ODBC 17, MARS, login-only TLS" 'FALSE +\| +Session' module \
+      isql_query "Driver={ODBC Driver 17 for SQL Server};Server=tcp:127.0.0.1,11433;UID=sa;PWD=$SQLCMDPASSWORD;Encrypt=no;MARS_Connection=yes"
+    login_only=3 mars=1
+  elif [[ "$pass" == observe ]]; then
+    echo "  skip: MARS (isql from unixODBC not installed)"
+  fi
+
+  # The module followed every TDS 7.x connection's encryption and found no errors.
+  [[ "$(module_stat encryption_login_only_total)" == "$login_only" ]] || fail "$pass: login-only connections not recognised"
+  [[ "$(module_stat encryption_full_total)" == 1 ]] || fail "$pass: full-encryption connection not recognised"
+  [[ "$(module_stat mars_connections_total)" == "$mars" ]] || fail "$pass: MARS connection not recognised"
+  [[ "$(module_stat protocol_errors_total)" == 0 ]] || fail "$pass: protocol errors on real clients"
+  [[ "$(module_stat tls_errors_total)" == 0 ]] || fail "$pass: TLS errors on real clients"
+  [[ "$(module_stat unparsed_connections_total)" == 0 ]] || fail "$pass: real clients left unparsed"
+  if [[ "$pass" == terminate ]]; then
+    # Every connection had TLS terminated on both legs, and its LOGIN7 read.
+    connections=$(( login_only + 1 ))
+    [[ "$(module_stat tls_terminated_total)" == "$connections" ]] || fail "terminate: TLS not terminated on every connection"
+    [[ "$(module_stat login7_seen_total)" == "$connections" ]] || fail "terminate: LOGIN7 not seen on every connection"
+  fi
+  stop_envoy
+done
 
 echo "PASS: mssql_server_test"

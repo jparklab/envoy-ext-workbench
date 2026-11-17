@@ -7,6 +7,21 @@
 # - TDS 7.x starts with a plain PRELOGIN packet: runs through the mssql_proxy
 #   dynamic module, then tcp_proxy (stat prefix mssql).
 # Envoy loads ${ENVOY_DYNAMIC_MODULES_SEARCH_PATH}/libmssql_proxy.so.
+#
+# As configured here the module only observes. To have it terminate TLS on
+# both legs (needed to read LOGIN7 when the client encrypts), give it a
+# filter_config (see modules/mssql_proxy/config.h):
+#
+#   filter_config:
+#     "@type": type.googleapis.com/google.protobuf.Struct
+#     value:
+#       tls:
+#         cert_file: /etc/mssql_proxy/proxy.pem     # presented to clients
+#         key_file: /etc/mssql_proxy/proxy.key
+#         upstream_ca_file: /etc/mssql_proxy/sql.pem  # CAs or the server's own cert
+#         upstream_server_name: sql.example.com     # optional SNI and name check
+#
+# tests/mssql_server_test.sh runs every client both ways.
 admin:
   address:
     socket_address: { address: 127.0.0.1, port_value: 9901 }

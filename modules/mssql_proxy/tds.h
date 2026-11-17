@@ -102,6 +102,11 @@ enum class PreloginEncryption : uint8_t {
 struct PreloginOptions {
   // ENCRYPTION option with the client-certificate bit (0x80) masked off.
   std::optional<PreloginEncryption> encryption;
+  // The client-certificate bit was set (client asks to authenticate with a
+  // certificate in the TLS handshake).
+  bool client_cert = false;
+  // Where the ENCRYPTION byte sits in the payload, for rewriting it in place.
+  std::optional<size_t> encryption_offset;
   // MARS option: 1 when requested (client) or accepted (server).
   std::optional<bool> mars;
 };
@@ -110,6 +115,10 @@ struct PreloginOptions {
 // headers removed). Every offset and length is bounds-checked.
 // Returns nullopt and sets error on malformed input.
 std::optional<PreloginOptions> parsePrelogin(std::string_view payload, std::string& error);
+
+// Builds a TDS message from a payload: packets of at most max_packet bytes
+// (header included), SPID 0, packet IDs from 1, EOM on the last packet.
+std::string makeTdsMessage(uint8_t type, std::string_view payload, size_t max_packet);
 
 // Smallest and largest packet size a login can negotiate (MS-TDS 2.2.6.4).
 inline constexpr uint32_t kTdsMinPacketSize = 512;
