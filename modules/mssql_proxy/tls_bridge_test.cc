@@ -152,6 +152,18 @@ TEST_P(BridgeModes, HoldsLoginUntilServerHandshakeDone) {
   EXPECT_EQ(h.server.received, makeTdsMessage(kTdsLogin7, login7Payload(), 4096));
 }
 
+TEST_P(BridgeModes, LoginOnlyMultiPacketLogin7WithPlainContinuation) {
+  Harness h(kEncOff, kEncOff, GetParam());
+  ASSERT_TRUE(h.connect()) << h.message();
+  const std::string login7 = login7Payload(longLogin());
+  ASSERT_GT(login7.size(), 512u - 8) << "must span packets";
+  sendSplitLogin7(h.client, login7, 512);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(h.server.received, makeTdsMessage(kTdsLogin7, login7, 512));
+  ASSERT_TRUE(h.bridge.login());
+  EXPECT_EQ(h.bridge.login()->user_name, "app_user");
+}
+
 INSTANTIATE_TEST_SUITE_P(Chunks, BridgeModes, ::testing::Values(0, 1, 7, 1000));
 
 // ---------------------------------------------------------------- PRELOGIN
@@ -238,6 +250,37 @@ TEST(Bridge, RejectsMalformedLogin7) {
   Harness h(kEncOn, kEncOn, 0);
   ASSERT_TRUE(h.connect()) << h.message();
   h.client.send(kTdsLogin7, login7Payload().substr(0, 60), true);
+  h.pump();
+  ASSERT_TRUE(h.error);
+  EXPECT_EQ(h.error->kind, BridgeError::Kind::Protocol);
+}
+
+TEST(Bridge, RejectsPlainFirstLogin7Packet) {
+  Harness h(kEncOff, kEncOff, 0);
+  ASSERT_TRUE(h.connect()) << h.message();
+  h.client.send(kTdsLogin7, login7Payload(longLogin()), /*over_tls=*/false, 512);
+  h.pump();
+  ASSERT_TRUE(h.error);
+  EXPECT_EQ(h.error->kind, BridgeError::Kind::Protocol);
+}
+
+TEST(Bridge, RejectsPlainLogin7WhileTlsPacketIncomplete) {
+  Harness h(kEncOff, kEncOff, 0);
+  ASSERT_TRUE(h.connect()) << h.message();
+  const std::string wire = makeTdsMessage(kTdsLogin7, login7Payload(longLogin()), 512);
+  h.client.sendRaw(wire.substr(0, 100), /*over_tls=*/true); // Part of the first packet.
+  h.client.sendRaw(wire.substr(512), /*over_tls=*/false);
+  h.pump();
+  ASSERT_TRUE(h.error);
+  EXPECT_EQ(h.error->kind, BridgeError::Kind::Protocol);
+}
+
+TEST(Bridge, LoginOnlyStillRejectsOtherPlainTypesDuringLogin7) {
+  Harness h(kEncOff, kEncOff, 0);
+  ASSERT_TRUE(h.connect()) << h.message();
+  const std::string wire = makeTdsMessage(kTdsLogin7, login7Payload(longLogin()), 512);
+  h.client.sendRaw(wire.substr(0, 512), /*over_tls=*/true); // First packet, no EOM.
+  h.client.send(kTdsSqlBatch, "select 1", /*over_tls=*/false);
   h.pump();
   ASSERT_TRUE(h.error);
   EXPECT_EQ(h.error->kind, BridgeError::Kind::Protocol);

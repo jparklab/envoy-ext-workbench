@@ -324,6 +324,25 @@ inline std::string loginResponse(std::string_view packet_size) {
   return loginAck() + envChangePacketSize(packet_size, "4096") + done();
 }
 
+// A SQL login long enough to span two 512-byte packets, with the password in
+// the first one.
+inline Login7Fields longLogin() {
+  Login7Fields f;
+  f.host = std::string(128, 'h');
+  f.app = std::string(128, 'a');
+  f.library = std::string(128, 'l');
+  return f;
+}
+
+// Sends LOGIN7 as mssql-jdbc does under login-only encryption: the first
+// packet over TLS, the rest in plain TDS.
+inline void sendSplitLogin7(Peer& client, std::string_view payload, size_t packet_size) {
+  const std::string wire = makeTdsMessage(kTdsLogin7, payload, packet_size);
+  const size_t first = (static_cast<uint8_t>(wire[2]) << 8) | static_cast<uint8_t>(wire[3]);
+  client.sendRaw(std::string_view(wire).substr(0, first), /*over_tls=*/true);
+  client.sendRaw(std::string_view(wire).substr(first), /*over_tls=*/false);
+}
+
 inline std::string smpPacket(uint8_t flags, std::string_view data) {
   std::string p{static_cast<char>(kSmpId), static_cast<char>(flags), 0, 0};
   const size_t len = kSmpHeaderSize + data.size();

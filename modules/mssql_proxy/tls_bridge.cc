@@ -309,6 +309,14 @@ std::optional<BridgeError> TlsBridge::onWireUnit(Direction d, const Unit& unit) 
       }
       return decrypt(d, unit.bytes);
     }
+    // MS-TDS: under login-only only the first LOGIN7 packet is encrypted; a
+    // longer login (e.g. Kerberos from mssql-jdbc) continues in plain packets.
+    // Accepted only after that first packet came whole over TLS.
+    if (i == kClient && leg_mode_[i] == EncryptionMode::LoginOnly &&
+        unit.kind == UnitKind::TdsPacket && unit.type == kTdsLogin7 && !login_ &&
+        !login7_message_.empty() && plain_[i].bufferedBytes() == 0) {
+      return onPlainUnit(d, unit);
+    }
     // Under login-only a leg turns plain once the login is under way: the
     // server answers LOGIN7 in plain TDS, and the client follows once answered.
     if (leg_mode_[i] == EncryptionMode::LoginOnly && app_sent_[i]) {
