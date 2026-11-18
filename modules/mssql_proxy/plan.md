@@ -519,7 +519,7 @@ delegation to the backend SPNs.
   and MIT tickets carry no PAC, so a successful login likely needs AD or Samba
   AD. The MIT KDC's DB2 backend can't grant constrained delegation (it refuses
   S4U2Proxy with KDC_ERR_BADOPTION), so a successful S4U2Proxy test needs AD
-  or Samba AD. Whether SQL Server checks Kerberos channel binding under EPA,
+  or Samba AD (`tests/ad/ad_env.sh up` brings up a Samba AD domain with a SQL Server for it). Whether SQL Server checks Kerberos channel binding under EPA,
   and which binding it and the drivers use (`tls-server-end-point` is what
   `channel_binding` offers; `tls-unique` is the other candidate).
 - Unverified from the handoff: MIT krb5 SPNEGO acceptance of Windows tokens; whether
