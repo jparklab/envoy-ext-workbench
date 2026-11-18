@@ -452,8 +452,13 @@ Server leg:
       SPN a TGT). MIT looks up the evidence ticket under the TGT's principal
       but names it after the principal that decrypted it, so with a principal
       named the proxy accepts with an in-memory keytab holding that principal's
-      keys first, then `keytab_file`'s (on AD the account's keys are the SPN's)
-      and rebuilt when either file changes. The MIT test realm names the ticket
+      keys first, then `keytab_file`'s (on AD the account's keys are the SPN's),
+      rebuilt when either file changes as a new keytab and credential (a
+      snapshot each exchange keeps; a keytab in use is never changed, a failed
+      rebuild keeps the old one). The account must exist only for the proxy:
+      the acceptor is unnamed, so it admits any ticket its keys decrypt. The
+      TGT is fetched when the filter loads, but a KDC that can't give it then
+      only draws a warning (it is fetched at the first login). The MIT test realm names the ticket
       after the SPN, so there only the TGT's principal and the account-keys
       acceptance can be tested, not an S4U2Proxy success
 - [x] `identity: service_account`: `gss_init_sec_context` with the proxy's own

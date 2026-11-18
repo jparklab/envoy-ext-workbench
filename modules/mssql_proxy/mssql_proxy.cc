@@ -538,6 +538,10 @@ public:
           DYM_LOG(handle, LogLevel::Error, "mssql_proxy: invalid Kerberos settings: {}", error);
           return nullptr;
         }
+        if (!terminator->startupWarning().empty()) {
+          DYM_LOG(handle, LogLevel::Warn, "mssql_proxy: Kerberos terminate: {}",
+                  terminator->startupWarning());
+        }
         config->auth->terminate = MssqlProxy::KerberosTerminate{
             .terminator = std::move(terminator),
             .spn = k->spn,

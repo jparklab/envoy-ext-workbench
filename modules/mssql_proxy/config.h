@@ -75,7 +75,9 @@
 // accepted with auth.kerberos.keytab_file's keys; with a principal named, the
 // proxy also accepts as that principal (its keys from the upstream keytab,
 // the SPN's on AD), which MIT needs to find the evidence ticket for
-// constrained delegation. NTLM logins still pass through
+// constrained delegation. That account must exist only for the proxy: the
+// acceptor is unnamed, so it admits any ticket its keys decrypt, a ticket for
+// the account itself included. NTLM logins still pass through
 // per "ntlm". "channel_binding" binds both legs to their TLS certificates.
 //
 // Unknown keys are rejected, so a typo can't silently disable a setting.

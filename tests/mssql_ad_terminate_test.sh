@@ -194,7 +194,7 @@ odbc_login() {
   cp "$AD_ENV_DIR/$user.ccache" "$ccache" # the login adds service tickets to it
   [[ "$nodeleg" == nodeleg ]] && preload="$TMP/gss_nodeleg_shim.so"
   echo "$QUERY" | env KRB5_CONFIG="$AD_KRB5_CONF" KRB5CCNAME="FILE:$ccache" ${preload:+LD_PRELOAD=$preload} \
-    timeout 60 isql -b -d'|' -k \
+    timeout 60 isql -v -b -d'|' -k \
     "Driver={ODBC Driver 17 for SQL Server};Server=tcp:127.0.0.1,$proxy_port;Trusted_Connection=yes;ServerSPN=$AD_PROXY_SPN;Encrypt=no" \
     2>&1
 }
@@ -211,12 +211,25 @@ expect_login() {
   [[ "$(module_stat login_denied_total)" == 0 ]] || fail "$label: the module refused the login"
   echo "  ok: $label: SUSER_NAME() = $want"
 }
-# expect_refused <label> <user> [nodeleg]: the login does not succeed.
+# expect_refused <label> <user> [nodeleg]: the proxy accepted the client's
+# Kerberos login and then refused it itself, when logging in to SQL Server (the
+# delegation the KDC would not grant): not any failure of the client. The
+# module's reason is in its log, read by expect_delegation_refusal_logged once
+# Envoy is stopped (start Envoy with MSSQL_MODULE_LOG_LEVEL=debug for it).
 expect_refused() {
   local label="$1" out
   shift
   if out="$(odbc_login "$@")"; then fail "$label: the login unexpectedly succeeded: $out"; fi
-  echo "  ok: $label: refused ($(tr '\n' ' ' <<<"$out" | cut -c1-160))"
+  grep -q "Login failed" <<<"$out" || fail "$label: the client reported no login failure: $out"
+  [[ "$(module_stat login_kerberos_total)" == 1 ]] || fail "$label: the client's Kerberos login was not seen"
+  [[ "$(module_stat login_denied_total)" == 1 ]] || fail "$label: the proxy did not refuse the login itself"
+  [[ "$(module_stat login_succeeded_total)" == 0 ]] || fail "$label: SQL Server accepted a login"
+  echo "  ok: $label: refused by the proxy ($(tr '\n' ' ' <<<"$out" | cut -c1-120))"
+}
+expect_delegation_refusal_logged() {
+  grep -q "Kerberos login to the server failed" "$TMP/envoy.log" \
+    || fail "$1: the module's log does not say the login to the server failed"
+  echo "  ok: $1: the module logged the failed Kerberos login to the server"
 }
 
 # --- 1. service_account
@@ -259,8 +272,9 @@ dc samba-tool delegation del-service "$AD_PROXY_ACCOUNT" "$AD_SQL_SPN" >/dev/nul
 start_envoy delegate
 expect_login "delegate, TGT forwarded, S4U2Proxy not allowed: alice" "$AD_DOMAIN\\alice" alice
 stop_envoy
-start_envoy delegate
+MSSQL_MODULE_LOG_LEVEL=debug start_envoy delegate
 expect_refused "delegate, nothing forwarded, S4U2Proxy not allowed: alice" alice nodeleg
-stop_envoy
+stop_envoy # Envoy flushes its log file on exit.
+expect_delegation_refusal_logged "delegate, nothing forwarded, S4U2Proxy not allowed: alice"
 
 echo "PASS: mssql_ad_terminate_test"

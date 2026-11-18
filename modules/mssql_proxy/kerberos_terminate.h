@@ -68,24 +68,42 @@ public:
   bool ensureProxyTgt(std::string& error) const;
   bool needsProxyTgt() const { return delegate_; }
 
+  // The credentials a new exchange accepts with, which it keeps for its life
+  // (called by the exchange at its first step, on a worker thread). Usually
+  // the ones made at creation; with a principal named for delegate, a
+  // snapshot rebuilt when a keytab file has changed (see below): a failed
+  // rebuild keeps the previous one and is retried by the next exchange.
+  // nullptr (error set) when there is none.
+  std::shared_ptr<const Creds> credsForAccept(std::string& error) const;
+
+  // What went wrong at creation without being fatal ("" for nothing): the
+  // proxy's own TGT couldn't be had then, and is fetched at the first login.
+  const std::string& startupWarning() const { return warning_; }
+
 private:
   GssTerminator() = default;
+
+  bool refreshCredsLocked(std::string& error) const;
 
   bool delegate_ = false;
   std::string tgt_keytab_;      // delegate: "FILE:<path>" of the keys the TGT is had with.
   std::string tgt_principal_;   // delegate: whose TGT; empty for tgt_keytab_'s first.
-  // delegate with a principal or client keytab named: the keytab the proxy
-  // accepts clients with, "MEMORY:<name>", holds that principal's keys from
-  // tgt_keytab_ and then all of service_keytab_ ("FILE:<path>"), refilled when
-  // either file changes. MIT names the evidence ticket for S4U2Proxy after
-  // the principal that decrypted it, and looks it up under the one the TGT is
-  // for, so the proxy must accept as the account (AD gives it the SPN's keys).
+  // delegate with a principal or client keytab named: the proxy accepts
+  // clients with an in-memory keytab of that principal's keys from tgt_keytab_
+  // and then all of service_keytab_ ("FILE:<path>"). MIT names the evidence
+  // ticket for S4U2Proxy after the principal that decrypted it, and looks it
+  // up under the one the TGT is for, so the proxy must accept as the account
+  // (AD gives it the SPN's keys). A keytab in use is never changed: when
+  // either file changes a new keytab and credential are built, as a new
+  // snapshot of creds_, which exchanges already running don't see.
+  bool rebuildable_ = false;
   std::string service_keytab_;
-  std::string acceptor_keytab_;
-  mutable std::string acceptor_stamp_; // Of the two files last read.
   std::string ccache_;        // "MEMORY:<name>".
-  std::unique_ptr<Creds> creds_;
+  // Immutable once published; replaced (under creds_mutex_ when rebuildable_).
+  mutable std::shared_ptr<const Creds> creds_;
+  mutable std::mutex creds_mutex_;
   mutable std::mutex tgt_mutex_;
+  std::string warning_;
 };
 
 } // namespace MssqlProxy

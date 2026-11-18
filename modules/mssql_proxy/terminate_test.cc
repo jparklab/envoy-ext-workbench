@@ -10,10 +10,15 @@
 #include <gssapi/gssapi_ext.h>
 #include <gssapi/gssapi_krb5.h>
 
+#include <atomic>
+#include <chrono>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "bridge_test_util.h"
 #include "gtest/gtest.h"
@@ -67,9 +72,12 @@ struct Bindings {
 // alice, as a Windows-like client: SPNEGO, mutual authentication.
 class Client {
 public:
-  Client(const std::string& kdc_dir, const char* spn, OM_uint32 flags, std::string binding = {})
+  // ccache: alice's credential cache; by default the one in the KDC's directory.
+  Client(const std::string& kdc_dir, const char* spn, OM_uint32 flags, std::string binding = {},
+         const std::string& ccache = {})
       : flags_(flags), binding_(std::move(binding)) {
-    cred_ = acquire(GSS_C_INITIATE, "ccache", "FILE:" + kdc_dir + "/alice.ccache");
+    cred_ = acquire(GSS_C_INITIATE, "ccache",
+                    "FILE:" + (ccache.empty() ? kdc_dir + "/alice.ccache" : ccache));
     gss_buffer_desc name = bufferOf(spn);
     OM_uint32 minor;
     EXPECT_FALSE(GSS_ERROR(gss_import_name(&minor, &name, GSS_KRB5_NT_PRINCIPAL_NAME, &target_)));
@@ -299,12 +307,14 @@ TEST_F(Terminate, DelegateAsAServiceAccountWithAForwardedTicket) {
 }
 
 // The same without a forwarded TGT: the proxy asks for constrained delegation
-// as the account. MIT then looks for alice's evidence ticket under the
-// account's name (the impersonator's), and this realm issued it under the
-// SPN's: Samba AD and AD name a ticket for an SPN after the account that owns
-// it, so there it is found (tests/mssql_ad_terminate_test.sh). Here the login
-// is refused, for that reason, which shows whose name the proxy delegates as.
+// as the account. This realm can't grant it (its database has no constrained
+// delegation, and names alice's ticket after the SPN where MIT looks for it
+// under the account's name; Samba AD and AD name it after the account, so
+// there it works: tests/mssql_ad_terminate_test.sh), so the login is refused
+// at the server leg whatever MIT's wording of why. What is checked is whose
+// TGT the proxy held: the account's, from the KDC's log.
 TEST_F(Terminate, ConstrainedDelegationIsAskedForAsTheNamedPrincipal) {
+  const size_t log = kdcLogSize();
   Harness h(kEncOn, kEncOn, 0, false, contexts(),
             BridgeOptions{.auth = settings(TerminateOptions{
                               .keytab_path = dir_ + "/proxy.keytab",
@@ -318,9 +328,13 @@ TEST_F(Terminate, ConstrainedDelegationIsAskedForAsTheNamedPrincipal) {
   EXPECT_EQ(error->kind, BridgeError::Kind::Denied);
   EXPECT_NE(error->message.find("Kerberos login to the server failed"), std::string::npos)
       << error->message;
-  EXPECT_NE(error->message.find("Matching credential not found"), std::string::npos)
-      << error->message;
   EXPECT_TRUE(h.server.received.empty());
+  const std::string logged = kdcLogSince(log);
+  EXPECT_NE(logged.find("svc-proxy@TEST.REALM for krbtgt/TEST.REALM"), std::string::npos)
+      << "the proxy held the account's TGT\n" << logged;
+  EXPECT_EQ(logged.find("MSSQLSvc/proxy.test:1433@TEST.REALM for krbtgt/TEST.REALM"),
+            std::string::npos)
+      << "not its SPN's\n" << logged;
 }
 
 // MIT names the evidence ticket after the principal that decrypted it and
@@ -356,7 +370,7 @@ TEST_F(Terminate, DelegatePrincipalTheKeytabLacksIsRefusedAtCreation) {
                                       .client_keytab_path = dir_ + "/svc-proxy.keytab",
                                       .principal = "nobody"},
                                      error));
-  EXPECT_NE(error.find("the proxy's own TGT"), std::string::npos) << error;
+  EXPECT_NE(error.find("the proxy's principal nobody"), std::string::npos) << error;
   // A client keytab alone: its first principal.
   EXPECT_TRUE(GssTerminator::create({.keytab_path = dir_ + "/proxy.keytab",
                                      .delegate = true,
@@ -367,6 +381,145 @@ TEST_F(Terminate, DelegatePrincipalTheKeytabLacksIsRefusedAtCreation) {
                                       .delegate = true,
                                       .client_keytab_path = dir_ + "/missing.keytab"},
                                      error));
+}
+
+// A TGT the KDC won't give at creation (here: the principal is in the keytab
+// but not in the KDC; a KDC that is down for a moment is the same) doesn't
+// refuse the config: it is warned of, and the login that needs it fails.
+TEST_F(Terminate, TgtThatCantBeHadAtCreationIsOnlyAWarning) {
+  std::string error;
+  auto terminator = GssTerminator::create({.keytab_path = dir_ + "/proxy.keytab",
+                                           .delegate = true,
+                                           .client_keytab_path = dir_ + "/ghost.keytab",
+                                           .principal = "ghost"},
+                                          error);
+  ASSERT_TRUE(terminator) << error;
+  EXPECT_NE(terminator->startupWarning().find("TGT"), std::string::npos)
+      << terminator->startupWarning();
+}
+
+// Replaces dst with src in one step, as a keytab rotation tool does.
+void replaceFile(const std::string& src, const std::string& dst) {
+  std::filesystem::copy_file(src, dst + ".new", std::filesystem::copy_options::overwrite_existing);
+  std::filesystem::rename(dst + ".new", dst);
+}
+
+// The keytab the proxy accepts with changes between logins, as in a key
+// rotation: the next login is accepted with the new keys, and the old ones
+// are gone.
+TEST_F(Terminate, ServiceKeytabRotationIsPickedUpBetweenLogins) {
+  const std::string live = dir_ + "/live.keytab";
+  replaceFile(dir_ + "/proxy.keytab", live);
+  auto auth = settings(TerminateOptions{.keytab_path = live,
+                                        .delegate = true,
+                                        .client_keytab_path = dir_ + "/svc-proxy.keytab",
+                                        .principal = "svc-proxy"});
+  auto login_to = [&](const char* spn) -> std::optional<BridgeError> {
+    Harness h(kEncOn, kEncOn, 0, false, contexts(), BridgeOptions{.auth = auth});
+    Client alice(dir_, spn, GSS_C_MUTUAL_FLAG | GSS_C_DELEG_FLAG);
+    Server server(dir_);
+    auto error = login(h, alice, server);
+    if (!error) {
+      EXPECT_EQ(server.who, "alice@TEST.REALM");
+    }
+    return error;
+  };
+  EXPECT_FALSE(login_to(kProxySpn)) << "the proxy's keys";
+  EXPECT_TRUE(login_to("MSSQLSvc/other.test:1433")) << "not the keys of another service yet";
+
+  replaceFile(dir_ + "/other.keytab", live); // Another service's keys, the proxy's gone.
+  EXPECT_FALSE(login_to("MSSQLSvc/other.test:1433")) << "the new keys are used";
+  auto gone = login_to(kProxySpn);
+  ASSERT_TRUE(gone) << "the old keys are not";
+  EXPECT_NE(gone->message.find("Kerberos login to the proxy failed"), std::string::npos)
+      << gone->message;
+
+  replaceFile(dir_ + "/proxy.keytab", live);
+  EXPECT_FALSE(login_to(kProxySpn)) << "and back";
+}
+
+// A keytab that can't be read for a moment (replaced, or removed by a
+// rotation tool) leaves logins on the keys they had.
+TEST_F(Terminate, FailedRebuildKeepsTheKeysInUse) {
+  const std::string live = dir_ + "/live2.keytab";
+  replaceFile(dir_ + "/proxy.keytab", live);
+  auto auth = settings(TerminateOptions{.keytab_path = live,
+                                        .delegate = true,
+                                        .client_keytab_path = dir_ + "/svc-proxy.keytab",
+                                        .principal = "svc-proxy"});
+  auto login_ok = [&]() {
+    Harness h(kEncOn, kEncOn, 0, false, contexts(), BridgeOptions{.auth = auth});
+    Client alice(dir_, kProxySpn, GSS_C_MUTUAL_FLAG | GSS_C_DELEG_FLAG);
+    Server server(dir_);
+    return !login(h, alice, server);
+  };
+  EXPECT_TRUE(login_ok());
+  std::filesystem::remove(live);
+  EXPECT_TRUE(login_ok()) << "the keytab is gone: the snapshot in use stays";
+  {
+    std::ofstream(live) << "not a keytab"; // Briefly unreadable garbage.
+  }
+  EXPECT_TRUE(login_ok()) << "so does a keytab that can't be read";
+  replaceFile(dir_ + "/proxy.keytab", live);
+  EXPECT_TRUE(login_ok()) << "and once it is whole again it is read again";
+}
+
+// Workers accept logins while the keytab file is replaced over and over, as
+// in a rotation. Both versions hold the proxy's keys, so every login must be
+// accepted: the keytab a login accepts with is never changed under it (the
+// crash this guards against is a use after free in MIT's in-memory keytab;
+// the number of threads and rounds is what makes it likely to show).
+TEST_F(Terminate, ConcurrentLoginsWhileTheKeytabIsReplaced) {
+  const std::string live = dir_ + "/live3.keytab";
+  replaceFile(dir_ + "/proxy.keytab", live);
+  std::string error;
+  auto terminator = GssTerminator::create({.keytab_path = live,
+                                           .delegate = true,
+                                           .client_keytab_path = dir_ + "/svc-proxy.keytab",
+                                           .principal = "svc-proxy"},
+                                          error);
+  ASSERT_TRUE(terminator) << error;
+
+  constexpr int kThreads = 8;
+  constexpr int kRounds = 100;
+  std::atomic<bool> stop{false};
+  std::atomic<int> accepted{0}, refused{0};
+  std::thread rotator([&] {
+    bool both = true;
+    while (!stop) {
+      replaceFile(dir_ + (both ? "/proxy-other.keytab" : "/proxy.keytab"), live);
+      both = !both;
+      std::this_thread::yield();
+    }
+  });
+  std::vector<std::thread> workers;
+  for (int t = 0; t < kThreads; ++t) {
+    workers.emplace_back([&, t] {
+      // A credential cache of its own: a file ccache is not for sharing.
+      const std::string ccache = dir_ + "/worker" + std::to_string(t) + ".ccache";
+      std::filesystem::copy_file(dir_ + "/alice.ccache", ccache,
+                                 std::filesystem::copy_options::overwrite_existing);
+      for (int i = 0; i < kRounds; ++i) {
+        Client alice(dir_, kProxySpn, GSS_C_MUTUAL_FLAG | GSS_C_DELEG_FLAG, {}, ccache);
+        const std::string token = alice.step();
+        auto exchange = terminator->start();
+        const KerberosExchange::Step step = exchange->accept(token, {});
+        if (step.error.empty() && step.complete) {
+          ++accepted;
+        } else {
+          ++refused;
+          ADD_FAILURE() << "refused: " << step.error;
+        }
+      }
+    });
+  }
+  for (std::thread& w : workers) {
+    w.join();
+  }
+  stop = true;
+  rotator.join();
+  EXPECT_EQ(refused, 0);
+  EXPECT_EQ(accepted, kThreads * kRounds);
 }
 
 TEST_F(Terminate, TicketForAnotherServiceIsRefused) {

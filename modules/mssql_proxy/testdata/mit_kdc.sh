@@ -7,8 +7,10 @@
 #   svc-proxy.keytab         svc-proxy (the proxy's service account)
 #   alice.ccache             alice@TEST.REALM's TGT (forwardable)
 #   kdc.pid                  stop with: kill "$(cat <dir>/kdc.pid)"
-# Also MSSQLSvc/other.test:1433, whose key is in no keytab. Every key is
-# random and throwaway.
+#   other.keytab             MSSQLSvc/other.test:1433
+#   proxy-other.keytab       MSSQLSvc/proxy.test:1433 and MSSQLSvc/other.test:1433
+#   ghost.keytab             a principal the KDC no longer has
+# Every key is random and throwaway.
 # Usage: mit_kdc.sh <dir>. Exits 77 when the MIT KDC tools are missing.
 set -euo pipefail
 dir="$1"
@@ -63,6 +65,15 @@ kadmin.local -q "ktadd -k $dir/service.keytab MSSQLSvc/sql.test:1433" >/dev/null
 kadmin.local -q "ktadd -k $dir/proxy.keytab MSSQLSvc/proxy.test:1433" >/dev/null
 kadmin.local -q "ktadd -k $dir/svc-proxy.keytab svc-proxy" >/dev/null
 kadmin.local -q "ktadd -norandkey -k $dir/alice.keytab alice" >/dev/null
+# For the rotation tests: the key of MSSQLSvc/other.test:1433 alone, and with
+# the proxy's, in one keytab (same keys as in the other files); and a
+# principal the KDC doesn't know (its keytab remains, the principal doesn't).
+kadmin.local -q "ktadd -k $dir/other.keytab MSSQLSvc/other.test:1433" >/dev/null
+kadmin.local -q "ktadd -norandkey -k $dir/proxy-other.keytab MSSQLSvc/proxy.test:1433" >/dev/null
+kadmin.local -q "ktadd -norandkey -k $dir/proxy-other.keytab MSSQLSvc/other.test:1433" >/dev/null
+kadmin.local -q "addprinc -randkey ghost" >/dev/null
+kadmin.local -q "ktadd -k $dir/ghost.keytab ghost" >/dev/null
+kadmin.local -q "delprinc -force ghost" >/dev/null
 krb5kdc -P "$dir/kdc.pid"
 for _ in $(seq 50); do
   KRB5CCNAME="FILE:$dir/alice.ccache" kinit -f -k -t "$dir/alice.keytab" alice 2>/dev/null && exit 0
