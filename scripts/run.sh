@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Run the locally built Envoy with a config from configs/.
 # Usage: scripts/run.sh [config]   (default: configs/envoy.yaml)
+# ENVOY_BIN overrides the Envoy binary.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"

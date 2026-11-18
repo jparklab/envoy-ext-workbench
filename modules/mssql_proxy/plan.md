@@ -337,9 +337,17 @@ The proxy relays the messages unchanged and reads the identity on the way.
 - [x] Unit tests on MS-NLMP-shaped messages (Unicode, OEM, UPN, v1,
       anonymous, malformed) and a relayed NEGOTIATE/CHALLENGE/AUTHENTICATE
       exchange through the bridge, plus a refusal at AUTHENTICATE
-- [ ] Integration test with a SQL Server that accepts NTLM: needs an
-      AD-joined SQL Server (Windows, or Linux joined to AD) and an NTLM client;
-      neither is available here
+- [x] Integration test against a real SQL Server, as far as SQL Server on Linux
+      goes (`tests/mssql_ad_relay_test.sh`: Samba AD + SQL Server 2025, FreeTDS
+      as the NTLM client, through Envoy with `ntlm: pass_through`): the login is
+      recognised as NTLM and not refused by the module, and SQL Server's own
+      refusal (error 18452, "untrusted domain", sent right after the client's
+      NEGOTIATE, with no CHALLENGE) reaches the client identical to a direct
+      login, with the refusal in the server's error log. This shows the
+      NEGOTIATE relayed and the server's answer passed back, not an NTLM login
+- [ ] Integration test where an NTLM login succeeds (CHALLENGE and AUTHENTICATE
+      relayed, identity read from AUTHENTICATE, LOGINACK): SQL Server on Linux
+      refuses NTLM, so this needs a Windows SQL Server joined to a domain
 
 Not done here: mapping NetBIOS to DNS domain names (or UPNs to
 `DOMAIN\user`) for the deny list; each form must be listed as clients send it.
@@ -393,10 +401,14 @@ still decides success.
       logs in with Kerberos through Envoy in the terminating and routing
       passes; the module reads `alice@TEST.REALM` and the access log shows it
       with the server's refusal
-- [ ] Integration test where the forwarded login succeeds: SQL Server must
-      accept the realm's tickets. A plain MIT realm has no PAC and SQL Server
-      on Linux maps Windows logins through AD, so this likely needs AD or a
-      Samba AD DC (see open questions)
+- [x] Integration test where the forwarded login succeeds, server-accepted:
+      `tests/mssql_ad_relay_test.sh` (Samba AD DC and SQL Server 2025 on Linux,
+      `tests/ad/ad_env.sh`) logs in with ODBC 17 as alice and as bob through
+      Envoy (TLS terminated, `read_ticket` with SQL Server's service keytab,
+      `ServerSPN` = SQL Server's SPN); the server accepts both, `SUSER_NAME()`
+      is `ADTEST\alice` / `ADTEST\bob` with `auth_scheme` KERBEROS, and the
+      module's log and the access log show `alice@AD.TEST` / `bob@AD.TEST`.
+      Samba AD, not Windows AD
 
 Deployment: the SPN the client targets (the proxy's host and port) must belong
 to the SQL Server's service account, and the proxy holds that account's keytab.
@@ -557,8 +569,10 @@ delegation to the backend SPNs; on AD or Samba AD name that account
 - Unverified from the handoff: MIT krb5 SPNEGO acceptance of Windows tokens; whether
   SQL Server checks the SPN on proxied logins; which drivers send the FEDAUTH
   channel binding token.
-- Unverified for NTLM: whether SQL Server on Linux accepts NTLM logins (else
-  testing needs a Windows SQL Server); which channel binding SQL Server checks
+- SQL Server 2025 on Linux does not accept NTLM (error 18452 right after the
+  NEGOTIATE; `tests/ad/ad_env_test.sh`, `tests/mssql_ad_relay_test.sh`), so a
+  successful NTLM login needs a Windows SQL Server. Unverified for NTLM:
+  which channel binding SQL Server checks
   for EPA, i.e. whether presenting the server's own certificate passes (same
   question as Kerberos); whether drivers (ODBC, SqlClient, JDBC) send raw
   NTLMSSP or SPNEGO-wrapped NTLM; whether the SSPI packet is plaintext under
