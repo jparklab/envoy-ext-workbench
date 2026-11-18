@@ -8,6 +8,10 @@
 #   ODBC 17 sqlcmd, -a 512         -> login-only TLS   -> mssql_proxy chain
 #     (512-byte packets, which the module then enforces)
 #   ODBC 17 isql, MARS, Encrypt=no -> login-only TLS   -> mssql_proxy chain
+#   split_login7.py (raw client)   -> login-only TLS   -> mssql_proxy chain
+#     (LOGIN7 over two packets, only the first encrypted, as MS-TDS requires
+#     and mssql-jdbc does with long Kerberos logins; also run against SQL
+#     Server directly first)
 #     (skipped when unixODBC's isql is missing)
 #
 # Uses SQL Server 2025: the 2022 Linux image rejects TDS 8.0 strict connections
@@ -107,6 +111,11 @@ for _ in $(seq 120); do
   sleep 1
 done
 [[ -n "$ready" ]] || fail "SQL Server did not become ready"
+
+SPLIT_LOGIN7=(python3 -I "$REPO_ROOT/modules/mssql_proxy/testdata/split_login7.py")
+out="$("${SPLIT_LOGIN7[@]}" 127.0.0.1 "$port" sa 2>&1)" \
+  || fail "SQL Server itself refused a LOGIN7 split across packets: $out"
+echo "  ok: SQL Server takes a LOGIN7 with only its first packet encrypted"
 
 # Writes the Envoy config for one pass: the container's port for every
 # cluster, the module's TLS settings (terminate, route), the access log path
@@ -328,14 +337,16 @@ for pass in observe terminate route; do
     sqlcmd_query env SSL_CERT_FILE="$TMP/mssql.pem" "$SQLCMD18" -S tcp:127.0.0.1,11433 -U sa -N s
   run_mode odbc17_small_packets "ODBC 17, 512-byte packets, login-only TLS" '^FALSE +512' module \
     sqlcmd_small_packets "$SQLCMD17" -S tcp:127.0.0.1,11433 -U sa
+  run_mode split_login7 "LOGIN7 over two packets, first encrypted, login-only TLS" \
+    '^LOGINACK split=[2-9]' module "${SPLIT_LOGIN7[@]}" 127.0.0.1 11433 sa
 
   # MARS over login-only TLS, so the module sees the SMP packets after login.
   # sqlcmd can't enable MARS; unixODBC's isql can, through a connection string.
-  login_only=2 mars=0
+  login_only=3 mars=0
   if command -v isql >/dev/null; then
     run_mode odbc17_mars "ODBC 17, MARS, login-only TLS" 'FALSE +\| +Session' module \
       isql_query "Driver={ODBC Driver 17 for SQL Server};Server=tcp:127.0.0.1,11433;UID=sa;PWD=$SQLCMDPASSWORD;Encrypt=no;MARS_Connection=yes"
-    login_only=3 mars=1
+    login_only=4 mars=1
   elif [[ "$pass" == observe ]]; then
     echo "  skip: MARS (isql from unixODBC not installed)"
   fi
