@@ -838,6 +838,34 @@ TEST(Terminate, RoundsWithTheServerStayLocal) {
   EXPECT_EQ(h.bridge.auth().result(), LoginResult::Succeeded);
 }
 
+// SQL Server sends its AP-REP in a message of its own and the login response
+// after it, and clients expect that shape: ODBC 17 waits for a second message
+// and times out on an AP-REP merged into the login response. The proxy's
+// AP-REP goes to the client where the server's was, in a message of its own.
+TEST(Terminate, TokenInItsOwnServerMessageReachesTheClientInItsOwn) {
+  Terminate t;
+  t.gss.accepts = {{.token = "proxy-ap-rep", .complete = true}};
+  t.gss.initiates = {{.token = "proxy-to-server"}, {.complete = true}};
+  Harness h(kEncOn, kEncOn, 0, false, contexts(), BridgeOptions{.auth = t.settings()});
+  ASSERT_TRUE(h.connect()) << h.message();
+  h.client.send(kTdsLogin7, login7Payload(kerberosLogin()), true);
+  ASSERT_TRUE(h.pump()) << h.message();
+
+  h.server.send(kTdsTabularResult, sspiToken("server-ap-rep"), true);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(t.gss.initiated.back(), "server-ap-rep");
+  EXPECT_EQ(h.client.received,
+            makeTdsMessage(kTdsTabularResult, sspiToken("proxy-ap-rep"), 4096))
+      << "the proxy's token, alone, where the server's was";
+
+  h.client.received.clear();
+  h.server.send(kTdsTabularResult, loginResponse("4096"), true);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(h.client.received, makeTdsMessage(kTdsTabularResult, loginResponse("4096"), 4096))
+      << "the login response without a second token";
+  EXPECT_EQ(h.bridge.auth().result(), LoginResult::Succeeded);
+}
+
 // Expects the login refused: ERROR 18456 to the client, and no LOGIN7 at the
 // server unless sent is set.
 void expectRefused(Harness& h, std::string_view reason, bool sent = false) {

@@ -893,13 +893,19 @@ std::optional<BridgeError> TlsBridge::finishServerMessage(const std::string& mes
   }
   auth_.onServerLoginMessage(scan);
   // The client gets the proxy's last token in place of the server's, which
-  // was meant for the proxy.
-  std::string payload =
-      replaceSspiTokens(message, scan, scan.login_ack ? client_final_token_ : std::string());
+  // was meant for the proxy, and in the message the server's came in: SQL
+  // Server sends its AP-REP alone, ahead of the login response, and clients
+  // wait for the second message (ODBC 17 times out on a merged one). A token
+  // is sent once: with the server's final SSPI token, or else with LOGINACK.
+  const bool server_token_final = scan.sspi && upstream_complete_ && !scan.error;
+  std::string payload = replaceSspiTokens(
+      message, scan, scan.login_ack || server_token_final ? client_final_token_ : std::string());
+  if (scan.login_ack || scan.error || server_token_final) {
+    client_final_token_.clear();
+  }
   if (scan.login_ack || scan.error) {
     kerberos_ = Kerberos::Done;
     scanning_login_ = false;
-    client_final_token_.clear();
   }
   if (payload.empty()) {
     return std::nullopt;
