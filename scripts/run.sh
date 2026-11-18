@@ -4,7 +4,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-ENVOY_BIN="$REPO_ROOT/envoy/bazel-bin/source/exe/envoy-static"
+ENVOY_BIN="${ENVOY_BIN:-$REPO_ROOT/envoy/bazel-bin/source/exe/envoy-static}"
 CONFIG="${1:-$REPO_ROOT/configs/envoy.yaml}"
 
 if [[ ! -x "$ENVOY_BIN" ]]; then

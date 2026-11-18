@@ -420,7 +420,9 @@ Client leg:
 - [x] Channel binding: `channel_binding: tls_server_end_point` passes each
       leg's certificate hash (RFC 5929), so clients that bind are checked; off
       by default, since which binding SQL Server and its drivers use is
-      unverified (open questions). Clients that don't bind still log in
+      unverified (open questions). Clients that don't bind still log in. SQL
+      Server 2025 accepts the proxy's login with `tls_server_end_point` set
+      (ODBC 17, service_account); that it verifies the binding is not shown
 - [x] Answer the client: the server's SSPI token is dropped from the login
       response and the proxy's (AP-REP) put in its place, the message
       re-framed (the server's SPID kept)
@@ -433,10 +435,18 @@ Server leg:
       (`GSS_C_BOTH`, the same keytab) so MIT keeps the client's ticket as
       evidence, requested as the proxy's SPN principal with its own TGT (kept
       fresh in the memory ccache). SQL Server sees the end user
-- [ ] S4U2Proxy that succeeds: needs a KDC that lets the proxy's account
+- [x] S4U2Proxy that succeeds: needs a KDC that lets the proxy's account
       delegate to the backend SPNs (AD constrained delegation or RBCD); the
       throwaway MIT realm (DB2) can't, so the test sees the KDC refuse
-      (`KDC can't fulfill requested option`) and the proxy refuse the login
+      (`KDC can't fulfill requested option`) and the proxy refuse the login.
+      Proven against Samba AD + SQL Server 2025 (`tests/mssql_ad_terminate_test.sh`):
+      a client that forwards nothing is accepted as itself, and refused once
+      svc-proxy's `msDS-AllowedToDelegateTo` is removed. Samba AD refuses an
+      AS-REQ for the SPN as a client name (`no such entry found in hdb`), so
+      the proxy's TGT must be the account's (`svc-proxy@AD.TEST`): for now the
+      keytab lists that principal first, then the SPN's keys (the module takes
+      the keytab's first principal); an explicit `upstream.principal` for
+      delegate is open (decision pending)
 - [x] `identity: service_account`: `gss_init_sec_context` with the proxy's own
       client keytab; SQL Server sees the proxy account, the proxy logs the user
 - [x] Backend SPN from the routed cluster (`cluster_spns`, default `spn`)
@@ -468,8 +478,14 @@ Async: the GSS calls may contact the KDC (S4U2Proxy, service tickets) and block.
       bindings right and wrong); the server test logs in with ODBC 17
       through terminate, and the KDC log shows the proxy asking for the
       server's ticket as its service account
-- [ ] Integration test where the server accepts the proxy's login: same need
-      as 5c (AD or Samba AD)
+- [x] Integration test where the server accepts the proxy's login: same need
+      as 5c (AD or Samba AD): `tests/mssql_ad_terminate_test.sh` logs in with
+      ODBC 17 through Envoy to the Samba AD + SQL Server of `tests/ad`:
+      `service_account` (SUSER_NAME() = `ADTEST\svc-proxy`), `delegate` with the
+      client's TGT forwarded (ODBC 17 asks for delegation itself) and without
+      (the same driver with the delegation flag taken out: S4U2Proxy), both
+      as the client's own user. It found that the proxy's AP-REP has to reach
+      the client in a message of its own, as SQL Server sends its own
 
 Deployment: clients use the proxy's SPN (e.g. `ServerSPN=MSSQLSvc/proxy:1433`,
 or DNS pointing the server name at the proxy with that SPN registered to the
