@@ -44,6 +44,20 @@ TEST(TlsContexts, RejectsBadSettings) {
 
 class BridgeModes : public ::testing::TestWithParam<size_t> {};
 
+// After a login-only login: the server answers in plain TDS, the client
+// carries on in plain TDS, and the server leg sends nothing more over TLS.
+void expectPlainSession(Harness& h) {
+  h.server.send(kTdsTabularResult, loginResponse("4096"), /*over_tls=*/false);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(h.bridge.auth().result(), LoginResult::Succeeded);
+  h.server.received.clear();
+  h.to_server_wire.clear();
+  h.client.send(kTdsSqlBatch, "select 1", /*over_tls=*/false);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(h.server.received, makeTdsMessage(kTdsSqlBatch, "select 1", 4096));
+  EXPECT_EQ(wireShape(h.to_server_wire), "P");
+}
+
 TEST_P(BridgeModes, LoginOnly) {
   Harness h(kEncOff, kEncOff, GetParam());
   ASSERT_TRUE(h.connect()) << h.message();
@@ -162,6 +176,51 @@ TEST_P(BridgeModes, LoginOnlyMultiPacketLogin7WithPlainContinuation) {
   EXPECT_EQ(h.server.received, makeTdsMessage(kTdsLogin7, login7, 512));
   ASSERT_TRUE(h.bridge.login());
   EXPECT_EQ(h.bridge.login()->user_name, "app_user");
+  // MS-TDS: only the first LOGIN7 packet goes encrypted to the server.
+  EXPECT_EQ(wireShape(h.to_server_wire), "TL");
+  EXPECT_EQ(h.to_server_wire.find(utf16("not-a-real-password")), std::string::npos)
+      << "password sent in clear";
+  expectPlainSession(h);
+}
+
+TEST_P(BridgeModes, LoginOnlyMultiPacketLogin7AllEncryptedIsResplit) {
+  Harness h(kEncOff, kEncOff, GetParam());
+  ASSERT_TRUE(h.connect()) << h.message();
+  const std::string login7 = login7Payload(longLogin());
+  h.client.send(kTdsLogin7, login7, /*over_tls=*/true, 512);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(h.server.received, makeTdsMessage(kTdsLogin7, login7, 512));
+  EXPECT_EQ(wireShape(h.to_server_wire), "TL");
+  EXPECT_EQ(h.to_server_wire.find(utf16("not-a-real-password")), std::string::npos);
+  expectPlainSession(h);
+}
+
+TEST_P(BridgeModes, LoginOnlySinglePacketLoginStaysOneRecord) {
+  Harness h(kEncOff, kEncOff, GetParam());
+  ASSERT_TRUE(h.connect()) << h.message();
+  h.client.send(kTdsLogin7, login7Payload(), /*over_tls=*/true);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(wireShape(h.to_server_wire), "T");
+  expectPlainSession(h);
+}
+
+TEST_P(BridgeModes, HoldsSplitLoginUntilServerHandshakeDone) {
+  Harness h(kEncOff, kEncOff, GetParam());
+  h.client.start();
+  h.deliver(true);
+  h.deliver(false);
+  ASSERT_TRUE(h.pump(/*hold_server=*/true)) << h.message();
+  ASSERT_TRUE(h.client.handshake_done);
+  ASSERT_FALSE(h.bridge.tlsEstablished());
+  const std::string login7 = login7Payload(longLogin());
+  sendSplitLogin7(h.client, login7, 512);
+  ASSERT_TRUE(h.pump(/*hold_server=*/true)) << h.message();
+  EXPECT_TRUE(h.server.received.empty());
+
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(h.server.received, makeTdsMessage(kTdsLogin7, login7, 512));
+  EXPECT_EQ(wireShape(h.to_server_wire), "TL");
+  expectPlainSession(h);
 }
 
 INSTANTIATE_TEST_SUITE_P(Chunks, BridgeModes, ::testing::Values(0, 1, 7, 1000));
@@ -363,6 +422,21 @@ TEST_P(LocalPrelogin, Mars) {
   Harness h(kEncOff, kEncOff, GetParam(), /*mars=*/true, contexts(), kLocal);
   loginAndQuery(h, true, false, true);
   EXPECT_TRUE(h.bridge.marsEnabled());
+}
+
+TEST_P(LocalPrelogin, FullClientLoginOnlyServerSplitsLogin) {
+  // The client encrypts everything; toward the server only the first LOGIN7
+  // packet may be encrypted.
+  Harness h(kEncOn, kEncOff, GetParam(), false, contexts(), kLocal);
+  h.client.start();
+  ASSERT_TRUE(h.pump()) << h.message();
+  const std::string login7 = login7Payload(longLogin());
+  h.client.send(kTdsLogin7, login7, /*over_tls=*/true, 512);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(h.bridge.encryptionMode(), EncryptionMode::Full);
+  EXPECT_EQ(h.bridge.serverEncryptionMode(), EncryptionMode::LoginOnly);
+  EXPECT_EQ(h.server.received, makeTdsMessage(kTdsLogin7, login7, 512));
+  EXPECT_EQ(wireShape(h.to_server_wire), "TL");
 }
 
 INSTANTIATE_TEST_SUITE_P(Chunks, LocalPrelogin, ::testing::Values(0, 1, 7, 1000));
@@ -693,6 +767,25 @@ INSTANTIATE_TEST_SUITE_P(Modes, TerminateModes,
                                            TerminateCase{kEncOn, kEncOn, true, true, true},
                                            TerminateCase{kEncNotSup, kEncOff, true, false, false},
                                            TerminateCase{kEncOff, kEncReq, true, true, true}));
+
+TEST(Terminate, LongRebuiltLoginSplitTowardLoginOnlyServer) {
+  // The proxy's own ticket can make the rebuilt LOGIN7 span packets; only the
+  // first goes encrypted to a login-only server.
+  Terminate t;
+  const std::string token(6000, 't');
+  t.gss.accepts = {{.token = "proxy-ap-rep", .complete = true}};
+  t.gss.initiates = {{.token = token}, {.complete = true}};
+  Harness h(kEncOff, kEncOff, 7, false, contexts(), BridgeOptions{.auth = t.settings()});
+  ASSERT_TRUE(h.connect()) << h.message();
+  h.client.send(kTdsLogin7, login7Payload(kerberosLogin()), /*over_tls=*/true);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(h.server.received, upstreamLogin(token));
+  EXPECT_EQ(wireShape(h.to_server_wire), "TL");
+
+  h.server.send(kTdsTabularResult, sspiToken("server-ap-rep") + loginResponse("4096"), false);
+  ASSERT_TRUE(h.pump()) << h.message();
+  EXPECT_EQ(h.bridge.auth().result(), LoginResult::Succeeded);
+}
 
 TEST(Terminate, RoundsWithTheClientStayLocal) {
   Terminate t;

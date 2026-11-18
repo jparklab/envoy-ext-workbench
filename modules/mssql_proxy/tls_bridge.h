@@ -242,7 +242,11 @@ private:
                                                  const LoginResponseScan& scan);
   // Channel binding application data for a leg, or empty.
   std::string channelBinding(size_t leg) const;
+  // Sends whole TDS packets on the other leg, encrypted as that leg needs.
+  // Under login-only toward the server, MS-TDS: only the first TDS packet sent
+  // after the handshake (the start of LOGIN7) is encrypted, the rest plain.
   std::optional<BridgeError> forward(Direction d, std::string_view bytes);
+  std::optional<BridgeError> encrypt(size_t to, std::string_view bytes, std::string& out);
   std::string drainTls(Leg& leg);
   void setMars(size_t leg, bool enabled);
   void setMaxPacketSize(size_t size);
@@ -260,11 +264,11 @@ private:
   std::array<Sink, 2> plain_sinks_;
   std::array<Stage, 2> stage_{Stage::Prelogin, Stage::Prelogin};
   std::array<EncryptionMode, 2> leg_mode_{EncryptionMode::Unknown, EncryptionMode::Unknown};
-  // Application data (after PRELOGIN and handshake) sent on each leg, and
-  // plain application data received from it: under login-only these mark
-  // where the leg leaves TLS.
+  // Application data (after PRELOGIN and handshake) sent on each leg: under
+  // login-only this marks where the leg's input leaves TLS.
   std::array<bool, 2> app_sent_{false, false};
-  std::array<bool, 2> plain_received_{false, false};
+  // Under login-only, the first packet toward the server has gone encrypted.
+  bool server_first_packet_sent_ = false;
 
   BridgeOutput* out_ = nullptr;      // Output of the call in progress.
   std::optional<BridgeError> error_; // Error raised inside a sink.

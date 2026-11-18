@@ -343,6 +343,28 @@ inline void sendSplitLogin7(Peer& client, std::string_view payload, size_t packe
   client.sendRaw(std::string_view(wire).substr(first), /*over_tls=*/false);
 }
 
+// What a captured wire carried after the PRELOGIN exchange, one character per
+// unit: 'T' a TLS record, 'L' a plain LOGIN7 packet, 'P' any other plain TDS
+// packet. PRELOGIN packets (the TLS handshake) are left out.
+inline std::string wireShape(std::string_view wire) {
+  struct Shape : UnitSink {
+    std::optional<std::string> onUnit(const Unit& unit) override {
+      if (unit.kind == UnitKind::TlsRecord) {
+        shape += 'T';
+      } else if (unit.type != kTdsPrelogin) {
+        shape += unit.type == kTdsLogin7 ? 'L' : 'P';
+      }
+      return std::nullopt;
+    }
+    std::string shape;
+  } sink;
+  StreamSplitter splitter;
+  if (auto error = splitter.feed(wire, sink)) {
+    return "error: " + *error;
+  }
+  return sink.shape;
+}
+
 inline std::string smpPacket(uint8_t flags, std::string_view data) {
   std::string p{static_cast<char>(kSmpId), static_cast<char>(flags), 0, 0};
   const size_t len = kSmpHeaderSize + data.size();

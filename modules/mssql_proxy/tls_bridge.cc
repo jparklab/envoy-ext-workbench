@@ -324,7 +324,6 @@ std::optional<BridgeError> TlsBridge::onWireUnit(Direction d, const Unit& unit) 
         return protocolError("plain TDS while a TLS-carried packet is incomplete");
       }
       stage = Stage::Plain;
-      plain_received_[i] = true;
       return onPlainUnit(d, unit);
     }
     return protocolError(std::format("plain {} type 0x{:02x} after TLS under {} encryption",
@@ -336,7 +335,6 @@ std::optional<BridgeError> TlsBridge::onWireUnit(Direction d, const Unit& unit) 
       return protocolError(std::format("raw TLS record in plain TDS under {} encryption",
                                        encryptionModeName(leg_mode_[i])));
     }
-    plain_received_[i] = true;
     return onPlainUnit(d, unit);
   }
   return std::nullopt;
@@ -941,25 +939,42 @@ std::optional<BridgeError> TlsBridge::forward(Direction d, std::string_view byte
     pending_to_server_.append(bytes);
     return std::nullopt;
   }
-  bool tls = false;
+  std::string& out = forwardOutput(d);
+  app_sent_[to] = true;
   switch (leg_mode_[to]) {
   case EncryptionMode::Unknown:
   case EncryptionMode::None:
-    break;
+    out += bytes;
+    return std::nullopt;
   case EncryptionMode::Full:
-    tls = true;
-    break;
+    return encrypt(to, bytes, out);
   case EncryptionMode::LoginOnly:
-    // The login goes to the server encrypted, until the server answers in
-    // plain TDS; the client side only ever receives plain TDS.
-    tls = to == kServer && !plain_received_[kServer];
     break;
   }
-  app_sent_[to] = true;
-  if (!tls) {
-    forwardOutput(d) += bytes;
+  // Login-only: the client side only ever receives plain TDS. Toward the
+  // server only the first TDS packet of LOGIN7 is encrypted (MS-TDS); a long
+  // login, e.g. with a Kerberos ticket, continues in plain packets.
+  if (to == kClient || server_first_packet_sent_) {
+    out += bytes;
     return std::nullopt;
   }
+  if (bytes.size() < kTdsHeaderSize) {
+    return protocolError("partial TDS packet for the server");
+  }
+  const size_t first = (static_cast<uint8_t>(bytes[2]) << 8) | static_cast<uint8_t>(bytes[3]);
+  if (first < kTdsHeaderSize || first > bytes.size()) {
+    return protocolError("partial TDS packet for the server");
+  }
+  server_first_packet_sent_ = true;
+  if (auto error = encrypt(to, bytes.substr(0, first), out)) {
+    return error;
+  }
+  out += bytes.substr(first);
+  return std::nullopt;
+}
+
+std::optional<BridgeError> TlsBridge::encrypt(size_t to, std::string_view bytes,
+                                              std::string& out) {
   Leg& leg = to == kServer ? up_ : down_;
   if (!leg.handshake_done) {
     return protocolError(std::format("data for the {} before its TLS handshake finished",
@@ -975,7 +990,7 @@ std::optional<BridgeError> TlsBridge::forward(Direction d, std::string_view byte
     }
     bytes.remove_prefix(static_cast<size_t>(n));
   }
-  forwardOutput(d) += drainTls(leg);
+  out += drainTls(leg);
   return std::nullopt;
 }
 
