@@ -35,8 +35,8 @@
 //         "channel_binding": "none",        // Or "tls_server_end_point"; default none.
 //         "upstream": {                     // How the proxy logs in to SQL Server.
 //           "identity": "service_account",  // Or "delegate" (as the client).
-//           "keytab_file": "/etc/mssql_proxy/proxy-client.keytab",  // service_account's keys.
-//           "principal": "svc-mssql-proxy@EXAMPLE.COM",  // service_account; optional.
+//           "keytab_file": "/etc/mssql_proxy/proxy-client.keytab",  // The account's keys.
+//           "principal": "svc-mssql-proxy@EXAMPLE.COM",  // The account; optional.
 //           "spn": "MSSQLSvc/sql1.example.com:1433",
 //           "cluster_spns": {"sql_sales": "MSSQLSvc/sql2.example.com:1433"}
 //         }
@@ -66,8 +66,16 @@
 // principal, and logs in to SQL Server with its own Kerberos exchange for
 // "spn" (or the routed cluster's in "cluster_spns"): as its service account
 // (upstream keytab_file required), or as the client ("delegate": the TGT the
-// client forwarded, or else constrained delegation as the proxy's own SPN
-// principal from auth.kerberos.keytab_file). NTLM logins still pass through
+// client forwarded, or else constrained delegation). The proxy's own TGT, for
+// constrained delegation, is the account upstream.principal from upstream
+// keytab_file; with neither given, the first principal of
+// auth.kerberos.keytab_file (the proxy's SPN, which an MIT KDC lets get a TGT;
+// Samba AD and likely AD do not, so there name the account). With principal
+// alone the keys are looked up in auth.kerberos.keytab_file. Clients are
+// accepted with auth.kerberos.keytab_file's keys; with a principal named, the
+// proxy also accepts as that principal (its keys from the upstream keytab,
+// the SPN's on AD), which MIT needs to find the evidence ticket for
+// constrained delegation. NTLM logins still pass through
 // per "ntlm". "channel_binding" binds both legs to their TLS certificates.
 //
 // Unknown keys are rejected, so a typo can't silently disable a setting.
@@ -100,8 +108,8 @@ struct KerberosConfig {
   std::string keytab_path; // read_ticket: the service's keytab; terminate: the proxy's.
   // terminate only:
   bool delegate = false;          // upstream.identity: delegate, else service_account.
-  std::string client_keytab_path; // upstream.keytab_file (service_account).
-  std::string principal;          // upstream.principal (service_account).
+  std::string client_keytab_path; // upstream.keytab_file (required for service_account).
+  std::string principal;          // upstream.principal.
   std::string spn;                // upstream.spn.
   std::vector<std::pair<std::string, std::string>> cluster_spns;
   ChannelBinding channel_binding = ChannelBinding::None;

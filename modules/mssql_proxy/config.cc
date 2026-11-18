@@ -197,22 +197,15 @@ bool parseUpstream(const Json& upstream, const FileReader& read_file, KerberosCo
     return false;
   }
   config.delegate = *identity == "delegate";
-  if (config.delegate) {
-    for (const char* key : {"keytab_file", "principal"}) {
-      if (upstream.contains(key)) {
-        error = std::format("auth.kerberos.upstream.{} is for service_account (delegate logs in "
-                            "as the client, with auth.kerberos.keytab_file's principal asking "
-                            "for constrained delegation)",
-                            key);
-        return false;
-      }
-    }
-  } else {
-    std::optional<std::string> keytab = keytabFile(upstream, kWhere, true, read_file, error);
-    if (!keytab) {
-      return false;
-    }
+  // service_account: the account's keys are required. delegate: optional, the
+  // keys of the principal that asks for constrained delegation (default: the
+  // first principal of auth.kerberos.keytab_file).
+  std::optional<std::string> keytab =
+      keytabFile(upstream, kWhere, !config.delegate, read_file, error);
+  if (keytab) {
     config.client_keytab_path = *keytab;
+  } else if (!error.empty()) {
+    return false;
   }
   if (auto principal = getString(upstream, "principal", kWhere, error)) {
     config.principal = *principal;

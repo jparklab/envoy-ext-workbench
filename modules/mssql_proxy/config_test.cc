@@ -206,7 +206,40 @@ TEST(Config, KerberosTerminate) {
   ASSERT_TRUE(config) << error;
   EXPECT_TRUE(config->kerberos->delegate);
   EXPECT_TRUE(config->kerberos->client_keytab_path.empty());
+  EXPECT_TRUE(config->kerberos->principal.empty()) << "none named: the keytab's first, as before";
   EXPECT_EQ(config->kerberos->channel_binding, ChannelBinding::None);
+}
+
+// delegate names the principal that asks for constrained delegation, and
+// optionally the keytab to have its TGT with, as service_account does.
+TEST(Config, DelegateTakesAPrincipalAndAKeytab) {
+  const FileReader keytabs = files({{"/c.pem", "CERT"}, {"/k.pem", "KEY"}, {"/ca.pem", "CA"},
+                                    {"/proxy.keytab", "KT"}, {"/account.keytab", "KT"}});
+  auto parse = [&](std::string_view upstream, std::string& error) {
+    return parseFilterConfig(std::format(R"({{{}, "auth": {{"kerberos": {{
+        "mode": "terminate", "keytab_file": "/proxy.keytab",
+        "upstream": {{"identity": "delegate", "spn": "MSSQLSvc/sql.test:1433"{}}}}}}}}})",
+                                         kTls, upstream),
+                             keytabs, error);
+  };
+  std::string error;
+  auto both = parse(R"(, "principal": "svc-proxy@TEST.REALM", "keytab_file": "/account.keytab")",
+                    error);
+  ASSERT_TRUE(both) << error;
+  EXPECT_TRUE(both->kerberos->delegate);
+  EXPECT_EQ(both->kerberos->keytab_path, "/proxy.keytab") << "the acceptor's keys stay";
+  EXPECT_EQ(both->kerberos->client_keytab_path, "/account.keytab");
+  EXPECT_EQ(both->kerberos->principal, "svc-proxy@TEST.REALM");
+
+  auto principal_only = parse(R"(, "principal": "svc-proxy")", error);
+  ASSERT_TRUE(principal_only) << error;
+  EXPECT_EQ(principal_only->kerberos->principal, "svc-proxy");
+  EXPECT_TRUE(principal_only->kerberos->client_keytab_path.empty());
+
+  auto keytab_only = parse(R"(, "keytab_file": "/account.keytab")", error);
+  ASSERT_TRUE(keytab_only) << error;
+  EXPECT_EQ(keytab_only->kerberos->client_keytab_path, "/account.keytab");
+  EXPECT_TRUE(keytab_only->kerberos->principal.empty());
 }
 
 TEST(Config, RejectsBadKerberosTerminate) {
@@ -224,16 +257,20 @@ TEST(Config, RejectsBadKerberosTerminate) {
       {terminate(R"(, "upstream": {"identity": "service_account", "spn": "s"})"),
        "upstream.keytab_file is required"},
       {terminate(R"(, "upstream": {"identity": "delegate"})"), "spn is required"},
-      {terminate(R"(, "upstream": {"identity": "delegate", "spn": "s", "principal": "p"})"),
-       "principal is for service_account"},
-      {terminate(R"(, "upstream": {"identity": "delegate", "spn": "s", "keytab_file": "/p.keytab"})"),
-       "keytab_file is for service_account"},
+      {terminate(R"(, "upstream": {"identity": "delegate", "spn": "s", "principal": 7})"),
+       "principal must be a non-empty string"},
+      {terminate(R"(, "upstream": {"identity": "delegate", "spn": "s", "keytab_file": "/missing.keytab"})"),
+       "upstream.keytab_file: no such file /missing.keytab"},
       {terminate(R"(, "upstream": {"identity": "delegate", "spn": "s", "cluster_spns": []})"),
        "cluster_spns must be an object"},
       {terminate(R"(, "channel_binding": "tls_unique", "upstream": {"identity": "delegate", "spn": "s"})"),
        "channel_binding must be"},
       {std::format(R"({{{}, "auth": {{"kerberos": {{"mode": "read_ticket", "keytab_file": "/p.keytab",
           "upstream": {{}}}}}}}})", kTls),
+       "upstream is for mode terminate"},
+      {std::format(R"({{{}, "auth": {{"kerberos": {{"mode": "read_ticket", "keytab_file": "/p.keytab",
+          "upstream": {{"identity": "delegate", "spn": "s", "principal": "svc-proxy",
+                        "keytab_file": "/p.keytab"}}}}}}}})", kTls),
        "upstream is for mode terminate"},
   };
   for (const auto& [json, want] : cases) {

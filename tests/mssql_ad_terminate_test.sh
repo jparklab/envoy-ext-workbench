@@ -26,8 +26,9 @@
 #
 # The proxy's own TGT for S4U2Proxy has to be the account's: Samba AD refuses
 # an AS-REQ for the SPN (Client 'MSSQLSvc/proxy.ad.test:1433@AD.TEST' not found
-# in Kerberos database), so with delegate the keytab_file lists svc-proxy@AD.TEST
-# first, then the SPN's keys.
+# in Kerberos database). So with delegate the module's upstream names the
+# account (principal svc-proxy, keytab_file the account's keys), while
+# auth.kerberos.keytab_file stays the SPN's keys it accepts clients with.
 #
 # Skips (exit 0) when Docker, the Kerberos or ODBC client tools, gcc with the
 # GSS-API headers (for the shim), openssl, python3 with PyYAML or the built
@@ -45,7 +46,7 @@ export ENVOY_DYNAMIC_MODULES_SEARCH_PATH="${ENVOY_DYNAMIC_MODULES_SEARCH_PATH:-$
 
 skip() { echo "SKIP: mssql_ad_terminate_test: $*"; exit 0; }
 command -v docker >/dev/null && docker info >/dev/null 2>&1 || skip "Docker is not available"
-for tool in kinit ktutil isql openssl python3 gcc curl; do
+for tool in kinit isql openssl python3 gcc curl; do
   command -v "$tool" >/dev/null || skip "$tool not found"
 done
 python3 -c "import yaml" 2>/dev/null || skip "python3 PyYAML not installed"
@@ -119,11 +120,6 @@ dc samba-tool delegation show "$AD_PROXY_ACCOUNT" | grep -q "$AD_SQL_SPN" \
   || fail "$AD_PROXY_ACCOUNT is not allowed to delegate to $AD_SQL_SPN"
 klist -k "$AD_PROXY_KEYTAB" | grep -q "$AD_PROXY_SPN@$AD_REALM" \
   || fail "the proxy keytab has no keys for $AD_PROXY_SPN"
-# The keytab for delegate: svc-proxy@AD.TEST first, as the module's first
-# principal is the proxy's TGT identity, then the SPN's keys it accepts with.
-printf 'rkt %s\nrkt %s\nwkt %s\nq\n' "$AD_PROXY_ACCOUNT_KEYTAB" "$AD_PROXY_KEYTAB" "$TMP/delegate.keytab" \
-  | ktutil >/dev/null 2>&1 || fail "could not combine the proxy's keytabs"
-chmod 644 "$TMP/delegate.keytab"
 echo "  ok: domain: $AD_PROXY_SPN on $AD_PROXY_ACCOUNT, delegation to $AD_SQL_SPN allowed"
 
 # Writes the Envoy config: the module terminating TLS on both legs and
@@ -133,10 +129,8 @@ echo "  ok: domain: $AD_PROXY_SPN on $AD_PROXY_ACCOUNT, delegation to $AD_SQL_SP
 # subject here).
 write_config() {
   local identity="$1" binding="$2"
-  local keytab="$AD_PROXY_KEYTAB"
-  [[ "$identity" == delegate ]] && keytab="$TMP/delegate.keytab"
   python3 -I - "$REPO_ROOT/configs/mssql_proxy.yaml" "$TMP/envoy.yaml" "$proxy_port" "$admin_port" \
-    "$AD_SQL_PORT" "$TMP" "$identity" "$binding" "$keytab" "$AD_PROXY_ACCOUNT_KEYTAB" \
+    "$AD_SQL_PORT" "$TMP" "$identity" "$binding" "$AD_PROXY_KEYTAB" "$AD_PROXY_ACCOUNT_KEYTAB" \
     "$AD_PROXY_ACCOUNT" "$AD_SQL_SPN" <<'EOF' || fail "could not write the Envoy config"
 import sys, yaml
 (src, dst, proxy_port, admin_port, sql_port, tmp, identity, binding, proxy_keytab,
@@ -152,9 +146,10 @@ for cluster in res["clusters"]:
 chain = next(c for c in listener["filter_chains"]
              if c["filter_chain_match"]["transport_protocol"] == "raw_buffer")
 module = next(f for f in chain["filters"] if f["name"] == "mssql_proxy")
-upstream = {"identity": identity, "spn": sql_spn}
-if identity == "service_account":
-    upstream.update({"keytab_file": account_keytab, "principal": account})
+# The account the proxy logs in as (service_account) or asks for constrained
+# delegation as (delegate); the acceptor's SPN keys are keytab_file either way.
+upstream = {"identity": identity, "spn": sql_spn,
+            "keytab_file": account_keytab, "principal": account}
 kerberos = {"mode": "terminate", "keytab_file": proxy_keytab, "upstream": upstream}
 if binding != "none":
     kerberos["channel_binding"] = binding

@@ -432,9 +432,10 @@ Client leg:
 Server leg:
 - [x] `identity: delegate`: the TGT the client forwarded (delegation flag);
       otherwise S4U2Proxy, with an acceptor credential that also initiates
-      (`GSS_C_BOTH`, the same keytab) so MIT keeps the client's ticket as
-      evidence, requested as the proxy's SPN principal with its own TGT (kept
-      fresh in the memory ccache). SQL Server sees the end user
+      (`GSS_C_BOTH`) so MIT keeps the client's ticket as evidence, requested
+      as the proxy's own principal (`upstream.principal`; by default the SPN's
+      principal from `keytab_file`) with its own TGT (kept fresh in the memory
+      ccache). SQL Server sees the end user
 - [x] S4U2Proxy that succeeds: needs a KDC that lets the proxy's account
       delegate to the backend SPNs (AD constrained delegation or RBCD); the
       throwaway MIT realm (DB2) can't, so the test sees the KDC refuse
@@ -443,10 +444,18 @@ Server leg:
       a client that forwards nothing is accepted as itself, and refused once
       svc-proxy's `msDS-AllowedToDelegateTo` is removed. Samba AD refuses an
       AS-REQ for the SPN as a client name (`no such entry found in hdb`), so
-      the proxy's TGT must be the account's (`svc-proxy@AD.TEST`): for now the
-      keytab lists that principal first, then the SPN's keys (the module takes
-      the keytab's first principal); an explicit `upstream.principal` for
-      delegate is open (decision pending)
+      the proxy's TGT must be the account's (`svc-proxy@AD.TEST`): with
+      `delegate`, `upstream.principal` (and optionally `upstream.keytab_file`,
+      else `keytab_file`) names the principal the proxy's TGT is had as, while
+      `keytab_file` stays the SPN's keys it accepts clients with; with neither
+      set the keytab's first principal is used, as before (an MIT KDC gives the
+      SPN a TGT). MIT looks up the evidence ticket under the TGT's principal
+      but names it after the principal that decrypted it, so with a principal
+      named the proxy accepts with an in-memory keytab holding that principal's
+      keys first, then `keytab_file`'s (on AD the account's keys are the SPN's)
+      and rebuilt when either file changes. The MIT test realm names the ticket
+      after the SPN, so there only the TGT's principal and the account-keys
+      acceptance can be tested, not an S4U2Proxy success
 - [x] `identity: service_account`: `gss_init_sec_context` with the proxy's own
       client keytab; SQL Server sees the proxy account, the proxy logs the user
 - [x] Backend SPN from the routed cluster (`cluster_spns`, default `spn`)
@@ -493,7 +502,9 @@ proxy's account). With `service_account` every login reaches SQL Server as the
 proxy's account, so per-user permissions there are lost; the proxy's
 deny list and routing are the access control. With `delegate`, clients must
 forward their TGT, or the proxy's account must be trusted for constrained
-delegation to the backend SPNs.
+delegation to the backend SPNs; on AD or Samba AD name that account
+(`upstream.principal`, with `upstream.keytab_file` if its keys are not in
+`keytab_file`), since an SPN gets no TGT there.
 
 ### Later
 

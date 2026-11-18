@@ -4,6 +4,8 @@
 #include <gssapi/gssapi_ext.h>
 #include <gssapi/gssapi_krb5.h>
 
+#include <sys/stat.h>
+
 #include <atomic>
 #include <ctime>
 #include <format>
@@ -19,11 +21,21 @@ namespace MssqlProxy {
 struct GssTerminator::Creds {
   gss_cred_id_t acceptor = GSS_C_NO_CREDENTIAL;
   gss_cred_id_t initiator = GSS_C_NO_CREDENTIAL; // service_account only.
+  // delegate with a principal named: a handle that keeps the acceptor's
+  // MEMORY keytab alive (MIT frees it when the last handle closes).
+  krb5_keytab memory_keytab = nullptr;
 
   ~Creds() {
     OM_uint32 minor;
     gss_release_cred(&minor, &acceptor);
     gss_release_cred(&minor, &initiator);
+    if (memory_keytab != nullptr) {
+      krb5_context context = nullptr;
+      if (krb5_init_context(&context) == 0) {
+        krb5_kt_close(context, memory_keytab);
+        krb5_free_context(context);
+      }
+    }
   }
 };
 
@@ -108,6 +120,81 @@ constexpr int64_t kRenewBefore = 600;
 std::string memoryCcache() {
   static std::atomic<uint64_t> next{1};
   return std::format("MEMORY:mssql_proxy_{}", next++);
+}
+
+std::string memoryKeytab() {
+  static std::atomic<uint64_t> next{1};
+  return std::format("MEMORY:mssql_proxy_kt_{}", next++);
+}
+
+// Changes when the "FILE:<path>" keytab is replaced or rewritten.
+std::string fileStamp(const std::string& keytab) {
+  struct stat st{};
+  if (stat(keytab.substr(std::string_view("FILE:").size()).c_str(), &st) != 0) {
+    return "?";
+  }
+  return std::format("{}.{}.{}", st.st_size, st.st_mtim.tv_sec, st.st_mtim.tv_nsec);
+}
+
+// Empties the in-memory keytab, then copies into it the entries of principal
+// (when not null) from the keytab source, then all those of the keytab rest.
+bool fillAcceptorKeytab(krb5_context ctx, const std::string& memory, const std::string& source,
+                        krb5_principal principal, const std::string& rest, std::string& error) {
+  krb5_keytab target = nullptr;
+  if (krb5_error_code code = krb5_kt_resolve(ctx, memory.c_str(), &target)) {
+    error = "acceptor keytab: " + krb5Message(ctx, code);
+    return false;
+  }
+  auto each = [&](const std::string& name, auto&& visit) -> krb5_error_code {
+    krb5_keytab kt = nullptr;
+    krb5_error_code code = krb5_kt_resolve(ctx, name.c_str(), &kt);
+    krb5_kt_cursor cursor;
+    if (code == 0 && (code = krb5_kt_start_seq_get(ctx, kt, &cursor)) == 0) {
+      krb5_keytab_entry entry;
+      while ((code = krb5_kt_next_entry(ctx, kt, &entry, &cursor)) == 0) {
+        visit(entry);
+        krb5_free_keytab_entry_contents(ctx, &entry);
+      }
+      krb5_kt_end_seq_get(ctx, kt, &cursor);
+      if (code == KRB5_KT_END) {
+        code = 0;
+      }
+    }
+    if (kt != nullptr) {
+      krb5_kt_close(ctx, kt);
+    }
+    return code;
+  };
+  std::vector<krb5_keytab_entry> old;
+  krb5_error_code code = each(memory, [&](krb5_keytab_entry& e) {
+    krb5_keytab_entry copy = e;
+    krb5_copy_principal(ctx, e.principal, &copy.principal);
+    krb5_copy_keyblock_contents(ctx, &e.key, &copy.key);
+    old.push_back(copy);
+  });
+  for (krb5_keytab_entry& e : old) {
+    krb5_kt_remove_entry(ctx, target, &e);
+    krb5_free_keytab_entry_contents(ctx, &e);
+  }
+  // A memory keytab lists the entry added last first, and the principal's
+  // keys must come first.
+  auto add = [&](krb5_keytab_entry& e) { krb5_kt_add_entry(ctx, target, &e); };
+  if (code == 0) {
+    code = each(rest, add);
+  }
+  if (code == 0 && principal != nullptr) {
+    code = each(source, [&](krb5_keytab_entry& e) {
+      if (krb5_principal_compare(ctx, e.principal, principal)) {
+        add(e);
+      }
+    });
+  }
+  krb5_kt_close(ctx, target);
+  if (code != 0) {
+    error = "acceptor keytab: " + krb5Message(ctx, code);
+    return false;
+  }
+  return true;
 }
 
 class GssExchange : public KerberosExchange {
@@ -282,20 +369,36 @@ bool GssTerminator::ensureProxyTgt(std::string& error) const {
   if (krb5_error_code code = krb5_kt_resolve(ctx, tgt_keytab_.c_str(), &keytab)) {
     return done(fail("keytab", code));
   }
-  // The keytab's first principal, as MIT's own client keytab use picks it.
-  krb5_kt_cursor cursor;
-  if (krb5_error_code code = krb5_kt_start_seq_get(ctx, keytab, &cursor)) {
-    return done(fail("keytab", code));
+  if (!tgt_principal_.empty()) {
+    // The one that was asked for (its realm, if not given, is the default).
+    if (krb5_error_code code = krb5_parse_name(ctx, tgt_principal_.c_str(), &client)) {
+      return done(fail("principal " + tgt_principal_, code));
+    }
+  } else {
+    // The keytab's first principal, as MIT's own client keytab use picks it.
+    krb5_kt_cursor cursor;
+    if (krb5_error_code code = krb5_kt_start_seq_get(ctx, keytab, &cursor)) {
+      return done(fail("keytab", code));
+    }
+    krb5_keytab_entry entry;
+    krb5_error_code code = krb5_kt_next_entry(ctx, keytab, &entry, &cursor);
+    if (code == 0) {
+      code = krb5_copy_principal(ctx, entry.principal, &client);
+      krb5_free_keytab_entry_contents(ctx, &entry);
+    }
+    krb5_kt_end_seq_get(ctx, keytab, &cursor);
+    if (code != 0) {
+      return done(fail("keytab", code));
+    }
   }
-  krb5_keytab_entry entry;
-  krb5_error_code code = krb5_kt_next_entry(ctx, keytab, &entry, &cursor);
-  if (code == 0) {
-    code = krb5_copy_principal(ctx, entry.principal, &client);
-    krb5_free_keytab_entry_contents(ctx, &entry);
-  }
-  krb5_kt_end_seq_get(ctx, keytab, &cursor);
-  if (code != 0) {
-    return done(fail("keytab", code));
+  if (!acceptor_keytab_.empty()) {
+    const std::string stamp = fileStamp(tgt_keytab_) + "|" + fileStamp(service_keytab_);
+    if (stamp != acceptor_stamp_) {
+      if (!fillAcceptorKeytab(ctx, acceptor_keytab_, tgt_keytab_, client, service_keytab_, error)) {
+        return done(false);
+      }
+      acceptor_stamp_ = stamp;
+    }
   }
   if (krb5_error_code c = krb5_cc_resolve(ctx, ccache_.c_str(), &ccache)) {
     return done(fail("ccache", c));
@@ -335,14 +438,12 @@ std::shared_ptr<const GssTerminator> GssTerminator::create(const TerminateOption
   if (!checkKeytab(options.keytab_path, error)) {
     return nullptr;
   }
-  if (!options.delegate) {
-    if (options.client_keytab_path.empty()) {
-      error = "service_account needs the client keytab of the account to log in as";
-      return nullptr;
-    }
-    if (!checkKeytab(options.client_keytab_path, error)) {
-      return nullptr;
-    }
+  if (!options.delegate && options.client_keytab_path.empty()) {
+    error = "service_account needs the client keytab of the account to log in as";
+    return nullptr;
+  }
+  if (!options.client_keytab_path.empty() && !checkKeytab(options.client_keytab_path, error)) {
+    return nullptr;
   }
   std::shared_ptr<GssTerminator> terminator(new GssTerminator());
   terminator->delegate_ = options.delegate;
@@ -353,12 +454,40 @@ std::shared_ptr<const GssTerminator> GssTerminator::create(const TerminateOption
   terminator->ccache_ = ccache;
 
   if (options.delegate) {
-    // The acceptor credential initiates too, with the same keys, which lets
-    // MIT keep a client's ticket as evidence for S4U2Proxy.
-    terminator->tgt_keytab_ = keytab;
-    terminator->creds_->acceptor =
-        acquire(GSS_C_NO_NAME, GSS_C_BOTH,
-                {{"keytab", keytab}, {"client_keytab", keytab}, {"ccache", ccache}}, error);
+    // The acceptor credential initiates too, which lets MIT keep a client's
+    // ticket as evidence for S4U2Proxy. It initiates as the proxy's own
+    // principal: by default the first of the service keytab, else the one
+    // named (from its own keytab if given) - which is had as its TGT now, so
+    // that the credential takes that identity from the ccache. The credential
+    // itself is unnamed: a named one would look for that principal's keys to
+    // accept with.
+    const bool explicit_principal = !options.principal.empty() || !options.client_keytab_path.empty();
+    terminator->tgt_keytab_ = options.client_keytab_path.empty() ? keytab : client;
+    terminator->tgt_principal_ = options.principal;
+    if (explicit_principal) {
+      terminator->service_keytab_ = keytab;
+      terminator->acceptor_keytab_ = memoryKeytab();
+      krb5_context kctx = threadKrb5Context(error);
+      if (kctx == nullptr) {
+        return nullptr;
+      }
+      if (krb5_error_code code = krb5_kt_resolve(kctx, terminator->acceptor_keytab_.c_str(),
+                                                 &terminator->creds_->memory_keytab)) {
+        error = "acceptor keytab: " + krb5Message(kctx, code);
+        return nullptr;
+      }
+      std::string tgt_error;
+      if (!terminator->ensureProxyTgt(tgt_error)) {
+        error = "the proxy's own TGT: " + tgt_error;
+        return nullptr;
+      }
+    }
+    terminator->creds_->acceptor = acquire(
+        GSS_C_NO_NAME, GSS_C_BOTH,
+        {{"keytab", explicit_principal ? terminator->acceptor_keytab_ : keytab},
+         {"client_keytab", terminator->tgt_keytab_},
+         {"ccache", ccache}},
+        error);
     if (terminator->creds_->acceptor == GSS_C_NO_CREDENTIAL) {
       error = "acceptor credentials: " + error;
       return nullptr;

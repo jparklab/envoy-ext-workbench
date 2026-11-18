@@ -10,7 +10,9 @@
 #include <gssapi/gssapi_ext.h>
 #include <gssapi/gssapi_krb5.h>
 
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <string>
 
 #include "bridge_test_util.h"
@@ -158,17 +160,33 @@ class Terminate : public ThrowawayKdc {
 protected:
   std::shared_ptr<const AuthSettings> settings(bool delegate,
                                                ChannelBinding binding = ChannelBinding::None) {
+    return settings(TerminateOptions{.keytab_path = dir_ + "/proxy.keytab",
+                                     .delegate = delegate,
+                                     .client_keytab_path =
+                                         delegate ? "" : dir_ + "/svc-proxy.keytab"},
+                    binding);
+  }
+
+  std::shared_ptr<const AuthSettings> settings(const TerminateOptions& options,
+                                               ChannelBinding binding = ChannelBinding::None) {
     std::string error;
-    auto terminator = GssTerminator::create(
-        {.keytab_path = dir_ + "/proxy.keytab",
-         .delegate = delegate,
-         .client_keytab_path = delegate ? "" : dir_ + "/svc-proxy.keytab"},
-        error);
+    auto terminator = GssTerminator::create(options, error);
     EXPECT_TRUE(terminator) << error;
     AuthSettings s;
     s.terminate = KerberosTerminate{
         .terminator = terminator, .spn = kServerSpn, .channel_binding = binding};
     return std::make_shared<const AuthSettings>(std::move(s));
+  }
+
+  // What the KDC logged since from (a size from kdcLogSize()).
+  size_t kdcLogSize() const {
+    std::ifstream in(dir_ + "/kdc.log", std::ios::binary | std::ios::ate);
+    return in ? static_cast<size_t>(in.tellg()) : 0;
+  }
+  std::string kdcLogSince(size_t from) const {
+    std::ifstream in(dir_ + "/kdc.log", std::ios::binary);
+    in.seekg(static_cast<std::streamoff>(from));
+    return {std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
   }
 
   // alice's LOGIN7 through the bridge; the server's half if it gets that far.
@@ -241,6 +259,114 @@ TEST_F(Terminate, ConstrainedDelegationTheKdcRefusesIsRefused) {
       << error->message;
   EXPECT_TRUE(h.server.received.empty());
   std::cout << "constrained delegation: " << error->message << "\n";
+}
+
+// With no principal named, the proxy's own TGT is its SPN's, as it always was
+// (an MIT KDC gives one; Samba AD and AD do not).
+TEST_F(Terminate, DelegateTakesTheProxysTgtAsItsSpnByDefault) {
+  const size_t log = kdcLogSize();
+  Harness h(kEncOn, kEncOn, 0, false, contexts(), BridgeOptions{.auth = settings(true)});
+  Client alice(dir_, kProxySpn, GSS_C_MUTUAL_FLAG | GSS_C_DELEG_FLAG);
+  Server server(dir_);
+  ASSERT_FALSE(login(h, alice, server)) << h.message();
+  EXPECT_EQ(server.who, "alice@TEST.REALM");
+  EXPECT_NE(kdcLogSince(log).find("MSSQLSvc/proxy.test:1433@TEST.REALM for krbtgt/TEST.REALM"),
+            std::string::npos);
+}
+
+// A principal and keytab of their own for the proxy's TGT, the service keytab
+// staying the acceptor's: the proxy still accepts with its SPN's keys, which
+// don't hold the account's.
+TEST_F(Terminate, DelegateAsAServiceAccountWithAForwardedTicket) {
+  const size_t log = kdcLogSize();
+  Harness h(kEncOn, kEncOn, 0, false, contexts(),
+            BridgeOptions{.auth = settings(TerminateOptions{
+                              .keytab_path = dir_ + "/proxy.keytab",
+                              .delegate = true,
+                              .client_keytab_path = dir_ + "/svc-proxy.keytab",
+                              .principal = "svc-proxy"})});
+  Client alice(dir_, kProxySpn, GSS_C_MUTUAL_FLAG | GSS_C_DELEG_FLAG);
+  Server server(dir_);
+  ASSERT_FALSE(login(h, alice, server)) << h.message();
+  EXPECT_EQ(server.who, "alice@TEST.REALM") << "the server sees the user";
+  EXPECT_EQ(alice.status, GSS_S_COMPLETE);
+  const std::string logged = kdcLogSince(log);
+  EXPECT_NE(logged.find("svc-proxy@TEST.REALM for krbtgt/TEST.REALM"), std::string::npos)
+      << "the proxy's TGT is the account's\n" << logged;
+  EXPECT_EQ(logged.find("MSSQLSvc/proxy.test:1433@TEST.REALM for krbtgt/TEST.REALM"),
+            std::string::npos)
+      << "not its SPN's\n" << logged;
+}
+
+// The same without a forwarded TGT: the proxy asks for constrained delegation
+// as the account. MIT then looks for alice's evidence ticket under the
+// account's name (the impersonator's), and this realm issued it under the
+// SPN's: Samba AD and AD name a ticket for an SPN after the account that owns
+// it, so there it is found (tests/mssql_ad_terminate_test.sh). Here the login
+// is refused, for that reason, which shows whose name the proxy delegates as.
+TEST_F(Terminate, ConstrainedDelegationIsAskedForAsTheNamedPrincipal) {
+  Harness h(kEncOn, kEncOn, 0, false, contexts(),
+            BridgeOptions{.auth = settings(TerminateOptions{
+                              .keytab_path = dir_ + "/proxy.keytab",
+                              .delegate = true,
+                              .client_keytab_path = dir_ + "/svc-proxy.keytab",
+                              .principal = "svc-proxy"})});
+  Client alice(dir_, kProxySpn, GSS_C_MUTUAL_FLAG);
+  Server server(dir_);
+  auto error = login(h, alice, server);
+  ASSERT_TRUE(error);
+  EXPECT_EQ(error->kind, BridgeError::Kind::Denied);
+  EXPECT_NE(error->message.find("Kerberos login to the server failed"), std::string::npos)
+      << error->message;
+  EXPECT_NE(error->message.find("Matching credential not found"), std::string::npos)
+      << error->message;
+  EXPECT_TRUE(h.server.received.empty());
+}
+
+// MIT names the evidence ticket after the principal that decrypted it and
+// looks it up under the account's name, so with an account named the proxy
+// also accepts as the account (on AD its keys are the SPN's): a ticket sealed
+// with the account's keys is taken, which the SPN's keytab alone can't.
+TEST_F(Terminate, DelegateAlsoAcceptsAsTheNamedAccount) {
+  {
+    Harness h(kEncOn, kEncOn, 0, false, contexts(),
+              BridgeOptions{.auth = settings(TerminateOptions{
+                                .keytab_path = dir_ + "/proxy.keytab",
+                                .delegate = true,
+                                .client_keytab_path = dir_ + "/svc-proxy.keytab",
+                                .principal = "svc-proxy"})});
+    Client alice(dir_, "svc-proxy", GSS_C_MUTUAL_FLAG | GSS_C_DELEG_FLAG);
+    Server server(dir_);
+    ASSERT_FALSE(login(h, alice, server)) << h.message();
+    EXPECT_EQ(server.who, "alice@TEST.REALM");
+  }
+  Harness h(kEncOn, kEncOn, 0, false, contexts(), BridgeOptions{.auth = settings(true)});
+  Client alice(dir_, "svc-proxy", GSS_C_MUTUAL_FLAG | GSS_C_DELEG_FLAG);
+  Server server(dir_);
+  auto error = login(h, alice, server);
+  ASSERT_TRUE(error) << "the SPN's keytab alone has no keys for the account";
+  EXPECT_NE(error->message.find("Kerberos login to the proxy failed"), std::string::npos)
+      << error->message;
+}
+
+TEST_F(Terminate, DelegatePrincipalTheKeytabLacksIsRefusedAtCreation) {
+  std::string error;
+  EXPECT_FALSE(GssTerminator::create({.keytab_path = dir_ + "/proxy.keytab",
+                                      .delegate = true,
+                                      .client_keytab_path = dir_ + "/svc-proxy.keytab",
+                                      .principal = "nobody"},
+                                     error));
+  EXPECT_NE(error.find("the proxy's own TGT"), std::string::npos) << error;
+  // A client keytab alone: its first principal.
+  EXPECT_TRUE(GssTerminator::create({.keytab_path = dir_ + "/proxy.keytab",
+                                     .delegate = true,
+                                     .client_keytab_path = dir_ + "/svc-proxy.keytab"},
+                                    error))
+      << error;
+  EXPECT_FALSE(GssTerminator::create({.keytab_path = dir_ + "/proxy.keytab",
+                                      .delegate = true,
+                                      .client_keytab_path = dir_ + "/missing.keytab"},
+                                     error));
 }
 
 TEST_F(Terminate, TicketForAnotherServiceIsRefused) {
