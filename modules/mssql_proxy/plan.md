@@ -341,13 +341,17 @@ The proxy relays the messages unchanged and reads the identity on the way.
       goes (`tests/mssql_ad_relay_test.sh`: Samba AD + SQL Server 2025, FreeTDS
       as the NTLM client, through Envoy with `ntlm: pass_through`): the login is
       recognised as NTLM and not refused by the module, and SQL Server's own
-      refusal (error 18452, "untrusted domain", sent right after the client's
-      NEGOTIATE, with no CHALLENGE) reaches the client identical to a direct
-      login, with the refusal in the server's error log. This shows the
-      NEGOTIATE relayed and the server's answer passed back, not an NTLM login
+      refusal (error 18452, "untrusted domain") reaches the client identical
+      to a direct login, with the refusal in the server's error log. SQL Server
+      refused the bare NTLMSSP NEGOTIATE that FreeTDS sends in LOGIN7; that no
+      CHALLENGE followed rests on ad-env's probe (`tests/ad/ad_env.sh` header,
+      `tests/ad/ad_env_test.sh`), not on this test. This shows the NEGOTIATE
+      relayed and the server's answer passed back, not an NTLM login
 - [ ] Integration test where an NTLM login succeeds (CHALLENGE and AUTHENTICATE
-      relayed, identity read from AUTHENTICATE, LOGINACK): SQL Server on Linux
-      refuses NTLM, so this needs a Windows SQL Server joined to a domain
+      relayed, identity read from AUTHENTICATE, LOGINACK): not shown on SQL
+      Server on Linux with a bare NTLMSSP token in LOGIN7. SPNEGO-wrapped NTLM
+      is untried (ODBC 17 with gss-ntlmssp never offered NTLM), so this may
+      still need a Windows SQL Server joined to a domain
 
 Not done here: mapping NetBIOS to DNS domain names (or UPNs to
 `DOMAIN\user`) for the deny list; each form must be listed as clients send it.
@@ -569,9 +573,10 @@ delegation to the backend SPNs; on AD or Samba AD name that account
 - Unverified from the handoff: MIT krb5 SPNEGO acceptance of Windows tokens; whether
   SQL Server checks the SPN on proxied logins; which drivers send the FEDAUTH
   channel binding token.
-- SQL Server 2025 on Linux does not accept NTLM (error 18452 right after the
-  NEGOTIATE; `tests/ad/ad_env_test.sh`, `tests/mssql_ad_relay_test.sh`), so a
-  successful NTLM login needs a Windows SQL Server. Unverified for NTLM:
+- SQL Server 2025 on Linux refuses a bare NTLMSSP token in LOGIN7 (FreeTDS:
+  error 18452 right after the NEGOTIATE; `tests/ad/ad_env_test.sh`,
+  `tests/mssql_ad_relay_test.sh`). SPNEGO-wrapped NTLM is untried, so a
+  successful NTLM login may still need a Windows SQL Server. Unverified for NTLM:
   which channel binding SQL Server checks
   for EPA, i.e. whether presenting the server's own certificate passes (same
   question as Kerberos); whether drivers (ODBC, SqlClient, JDBC) send raw

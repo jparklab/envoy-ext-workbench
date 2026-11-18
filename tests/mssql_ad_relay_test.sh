@@ -207,7 +207,9 @@ if grep -q '^Msg 18452' <<<"$via_out"; then
   expect_stat login_failed_total 1 "the server's refusal was not seen"
   expect_stat protocol_errors_total 0 "protocol errors on the NTLM login"
   echo "  ok: NTLM through Envoy: the server's own refusal reached the client unchanged: $(refusal "$via_out" | tr -s '\t\n' ' ')"
-elif grep -q 'ADTEST.alice' <<<"$via_out"; then
+elif grep -Eq '^([0-9]+> )*ADTEST\\alice[[:space:]]+NTLM[[:space:]]*$' <<<"$via_out"; then
+  # The whole result row (tsql may prefix its prompts): SUSER_NAME() and an
+  # auth_scheme of NTLM, which no error message line can match.
   ntlm_accepted=1
   expect_stat login_ntlm_total 1 "the NTLM login was not recognised"
   expect_stat login_succeeded_total 3 "the server's acceptance of the NTLM login was not seen"
