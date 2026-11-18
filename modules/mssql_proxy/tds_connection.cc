@@ -172,6 +172,15 @@ std::optional<std::string> ConnectionTracker::onLaterUnit(Direction d, const Uni
       stage = Stage::Plain; // Back to plain TDS once the login is answered.
       return std::nullopt;
     }
+    // MS-TDS: under login-only only the first LOGIN7 packet is encrypted; a
+    // longer login (e.g. Kerberos from mssql-jdbc) continues in plain packets.
+    // The first packet can't be decrypted here, so a plain LOGIN7 after a
+    // login that already ended in it goes unnoticed.
+    if (client && mode_ == EncryptionMode::LoginOnly && unit.kind == UnitKind::TdsPacket &&
+        unit.type == kTdsLogin7 && !login7_plain_ended_) {
+      login7_plain_ended_ = unit.eom;
+      return std::nullopt;
+    }
     return std::format("plain {} type 0x{:02x} after TLS under {} encryption",
                        unitKindName(unit.kind), unit.type, encryptionModeName(mode_));
 

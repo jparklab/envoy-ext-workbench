@@ -100,6 +100,8 @@ private:
   EncryptionMode mode_ = EncryptionMode::Unknown;
   bool mars_ = false;
   bool passive_ = false;
+  // Under login-only, a plain LOGIN7 packet with EOM ended the client's login.
+  bool login7_plain_ended_ = false;
   // Scanning the server's plain login messages for LOGINACK and the packet size.
   bool scanning_login_ = true;
   size_t login_messages_scanned_ = 0;

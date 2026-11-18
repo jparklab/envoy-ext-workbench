@@ -328,6 +328,40 @@ TEST(ConnectionTracker, RejectsPlainLoginWhenEncrypting) {
   EXPECT_TRUE(t.onClientData(tdsPacket(kTdsLogin7, true, "plaintext login")));
 }
 
+// Login-only, both handshakes done, and the first LOGIN7 packet sent over TLS.
+void startLoginOnlyLogin(ConnectionTracker& t) {
+  ASSERT_FALSE(t.onClientData(clientPrelogin(0x00)));
+  ASSERT_FALSE(t.onServerData(serverPrelogin(0x00)));
+  ASSERT_FALSE(t.onClientData(tdsPacket(kTdsPrelogin, true, "\x16\x03\x01 hello")));
+  ASSERT_FALSE(t.onServerData(tdsPacket(kTdsPrelogin, true, "\x16\x03\x03 hello")));
+  ASSERT_FALSE(t.onClientData(tlsRecord(0x17, "login7 first packet")));
+  ASSERT_EQ(t.encryptionMode(), EncryptionMode::LoginOnly);
+}
+
+TEST(ConnectionTracker, LoginOnlyAcceptsPlainLogin7ContinuationAfterTls) {
+  // mssql-jdbc encrypts only the first packet of a long (Kerberos) LOGIN7, as
+  // MS-TDS requires under login-only encryption.
+  ConnectionTracker t;
+  startLoginOnlyLogin(t);
+  EXPECT_FALSE(t.onClientData(tdsPacket(kTdsLogin7, false, "second")));
+  EXPECT_FALSE(t.onClientData(tdsPacket(kTdsLogin7, true, "third")));
+  EXPECT_FALSE(t.onServerData(tdsPacket(kTdsTabularResult, true, loginAck() + done())));
+  EXPECT_FALSE(t.onClientData(tdsPacket(kTdsSqlBatch, true, "select 1")));
+}
+
+TEST(ConnectionTracker, LoginOnlyStillRejectsOtherPlainTypesAfterTls) {
+  ConnectionTracker t;
+  startLoginOnlyLogin(t);
+  EXPECT_TRUE(t.onClientData(tdsPacket(kTdsSqlBatch, true, "select 1")));
+}
+
+TEST(ConnectionTracker, LoginOnlyRejectsPlainLogin7AfterItsEnd) {
+  ConnectionTracker t;
+  startLoginOnlyLogin(t);
+  ASSERT_FALSE(t.onClientData(tdsPacket(kTdsLogin7, true, "last")));
+  EXPECT_TRUE(t.onClientData(tdsPacket(kTdsLogin7, true, "another")));
+}
+
 TEST(ConnectionTracker, RejectsOutOfOrder) {
   {
     ConnectionTracker t;
